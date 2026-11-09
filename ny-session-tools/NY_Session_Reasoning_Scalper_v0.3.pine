@@ -1,0 +1,905 @@
+//@version=6
+strategy("ASADS NY Session Reasoning Scalper v0.3", shorttitle="ASADS NYS v0.3", overlay=true, pyramiding=0, initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=5, commission_type=strategy.commission.cash_per_contract, commission_value=1.25, slippage=2, use_bar_magnifier=true, process_orders_on_close=false, calc_on_every_tick=false, calc_on_order_fills=false, max_labels_count=300, max_bars_back=2000, margin_long=5, margin_short=5)
+// ============================================================================
+// ASADS NY SESSION REASONING SCALPER v0.3 (+ RESEARCH MODE)
+//
+// Thinks like a discretionary trader, one closed 5m candle at a time:
+//
+//   1) PREMARKET PLAN (at 06:30 PT)  where did we open vs the prior day, what did
+//      overnight do → favor longs / shorts / both. Updated after the opening
+//      range: accepted above OR + VWAP → longs, below → shorts, inside → keep plan.
+//   2) MARKET READ  TREND UP / TREND DOWN / RANGE / MIXED (VWAP side, EMA slope,
+//      swing structure, efficiency). Picks setups that fit the market.
+//   3) SETUPS  trend pullback · level rejection / sweep · break + retest · trap.
+//   4) CANDLE STORY  reads the 1-minute candles INSIDE the 5m signal candle:
+//      which extreme printed first, who pushed first, who won the second half,
+//      who controlled the closing minute, where it closed. Score 0–5 per side.
+//   5) ORDER FLOW  footprint delta / stacked imbalances / absorption.
+//   6) LEARNING (walk-forward)  every setup the bot sees becomes a SHADOW trade
+//      (did it hit TP1 before the stop?). Results are stored per
+//      setup × day-plan alignment × story strength. A real trade is only taken
+//      when that exact context has a proven past win rate. Outcomes are only
+//      counted after they resolve, so nothing peeks into the future.
+//   7) MANAGE  next-bar entry · TP1 +20 (3 ct) · runner +40 · BE after TP1.
+//   8) GUARD  max trades / losses / $ loss per day, cooldown, flat by 13:15.
+//
+// Research tool. Scores are transparent rules, not probabilities.
+// Use a 5m MNQ chart with extended hours. Footprint needs Premium.
+// ============================================================================
+
+const string TZ = "America/Los_Angeles"
+const int ST_RANGE = 0
+const int ST_UP = 1
+const int ST_DN = -1
+const int ST_MIXED = 2
+
+// ---------------------------------------------------------------- inputs
+const string G_RS = "0 · RESEARCH MODE (data collection)"
+bool researchMode = input.bool(true, "Research mode: snapshot the market every bar, test +X vs -X first", group=G_RS)
+int researchBars = input.int(36, "Research: give up after N bars", minval=1, group=G_RS)
+float researchMove = input.float(40.0, "Research: move size to test (points)", minval=1, group=G_RS)
+const string G_SES = "1 · Session (Pacific time)"
+string sessTrade = input.session("0630-1315", "NY trading window", group=G_SES)
+string sessRth = input.session("0630-1300", "Cash session (levels + VWAP)", group=G_SES)
+string sessOn = input.session("1500-0630", "Overnight session", group=G_SES)
+string sessOr = input.session("0630-0700", "Opening range", group=G_SES)
+int lastEntryHHMM = input.int(1250, "No new entries after (HHMM)", group=G_SES)
+int flatHHMM = input.int(1310, "Force flat on bar starting at (HHMM)", group=G_SES)
+
+const string G_TR = "2 · Trade plan"
+int qtyTotal = input.int(5, "Contracts", minval=1, group=G_TR)
+int qtyTp1 = input.int(3, "Contracts off at TP1 (0 = none)", minval=0, group=G_TR)
+float tp1Pts = input.float(20.0, "TP1 points", minval=1, group=G_TR)
+float tp2Pts = input.float(40.0, "Runner target points", minval=1, group=G_TR)
+bool beAfterTp1 = input.bool(true, "Runner stop to breakeven after TP1", group=G_TR)
+float stopBuf = input.float(2.0, "Stop buffer (points)", minval=0, group=G_TR)
+float minStop = input.float(6.0, "Min stop (points)", minval=1, group=G_TR)
+float maxStop = input.float(35.0, "Max stop (points) — wider = skip", minval=1, group=G_TR)
+float minRoom = input.float(20.0, "Min room to next opposing level (points)", minval=0, group=G_TR)
+string entryMode = input.string("Next bar open", "Entry type", options=["Next bar open", "Stop beyond signal candle"], group=G_TR)
+int entryExpiry = input.int(2, "Stop-entry valid for (bars)", minval=1, group=G_TR)
+
+const string G_GD = "3 · Daily guard"
+int maxTrades = input.int(3, "Max trades per day", minval=1, group=G_GD)
+int maxLosses = input.int(2, "Stop after N losses", minval=1, group=G_GD)
+float maxDayLoss = input.float(600.0, "Stop after day loss ($)", minval=0, group=G_GD)
+int cooldownBars = input.int(3, "Cooldown bars after a trade", minval=0, group=G_GD)
+
+const string G_SU = "4 · Setups"
+bool usePullback = input.bool(true, "Trend PULLBACK", group=G_SU)
+bool useRejection = input.bool(true, "Level REJECTION / SWEEP", group=G_SU)
+bool useRetest = input.bool(true, "BREAK + RETEST", group=G_SU)
+bool useTrap = input.bool(true, "FAILED BREAK (TRAP)", group=G_SU)
+float rvolLevel = input.float(1.5, "Rel. volume needed at a level", minval=0, step=0.1, group=G_SU)
+float rvolBreak = input.float(1.8, "Rel. volume needed for a break", minval=0, step=0.1, group=G_SU)
+float rvolPull = input.float(1.2, "Rel. volume needed on pullback trigger", minval=0, step=0.1, group=G_SU)
+float levelTolAtr = input.float(0.15, "Level touch tolerance (ATR)", minval=0, step=0.05, group=G_SU)
+int slotDays = input.int(20, "Same-slot volume memory (days)", minval=2, group=G_SU)
+
+const string G_CS = "5 · Candle story (inside each 5m candle)"
+bool useStory = input.bool(true, "Require a strong candle story", group=G_CS)
+string subTf = input.timeframe("1", "Sub-candle timeframe", group=G_CS)
+int minStory = input.int(3, "Min story score to enter (0–5)", minval=0, maxval=5, group=G_CS)
+
+const string G_PM = "6 · Premarket / day plan"
+bool useDayBias = input.bool(true, "Don't trade against the day plan", group=G_PM)
+
+const string G_LR = "7 · Learning (walk-forward)"
+bool useLearning = input.bool(true, "Only take setups proven in this context", group=G_LR)
+int learnMinN = input.int(6, "Min past samples before trusting a context", minval=1, group=G_LR)
+float learnMinWr = input.float(65.0, "Min past win rate to take it (%)", minval=0, maxval=100, group=G_LR)
+bool tradeUnproven = input.bool(false, "Also trade contexts that are still learning", group=G_LR)
+int shadowBars = input.int(24, "Bars allowed for a shadow trade to resolve", minval=3, group=G_LR)
+
+// NOTE: no input.source links to Market Eyes. A script may depend on only ONE
+// request.footprint() call, and Eyes makes its own — linking would error out.
+const string G_FP = "8 · Footprint (Premium) — who is stronger"
+bool useFp = input.bool(true, "Use footprint order flow", group=G_FP)
+bool fpRequire = input.bool(true, "Require flow to agree with the trade", group=G_FP, tooltip="Flow agrees if: bar delta leans our way, OR 3+ stacked imbalances our way, OR the other side got absorbed at the extreme (e.g. heavy selling at the low but the candle closed up).")
+int fpTicks = input.int(10, "Ticks per footprint row", minval=1, maxval=200, group=G_FP)
+float fpImbPct = input.float(300.0, "Imbalance %", minval=100, group=G_FP)
+float fpMinDelta = input.float(0.08, "Min bar delta (fraction of volume)", minval=0, step=0.01, group=G_FP)
+
+const string G_VS = "9 · Visuals"
+bool showLevels = input.bool(true, "Show levels", group=G_VS)
+bool showPanel = input.bool(true, "Show reasoning panel", group=G_VS)
+bool showSkips = input.bool(true, "Show skipped setups (gray)", group=G_VS)
+string panelPosIn = input.string("Middle right", "Panel position", options=["Top right", "Middle right", "Bottom right", "Top center", "Bottom center", "Bottom left"], group=G_VS)
+
+// ---------------------------------------------------------------- helpers
+f_pts(float x) => na(x) ? "—" : str.tostring(x, "#.##")
+
+f_nearestAbove(array<float> prices, array<string> names, float ref) =>
+    float best = na
+    string nm = ""
+    for i = 0 to prices.size() - 1
+        float v = prices.get(i)
+        if not na(v) and v > ref and (na(best) or v < best)
+            best := v
+            nm := names.get(i)
+    [best, nm]
+
+f_nearestBelow(array<float> prices, array<string> names, float ref) =>
+    float best = na
+    string nm = ""
+    for i = 0 to prices.size() - 1
+        float v = prices.get(i)
+        if not na(v) and v < ref and (na(best) or v > best)
+            best := v
+            nm := names.get(i)
+    [best, nm]
+
+f_mapInt(map<string, int> m, string k) => m.contains(k) ? m.get(k) : 0
+
+// ---------------------------------------------------------------- clock
+int hhmm = hour(time, TZ) * 100 + minute(time, TZ)
+bool inTrade = not na(time(timeframe.period, sessTrade, TZ))
+bool inRth = not na(time(timeframe.period, sessRth, TZ))
+bool inOn = not na(time(timeframe.period, sessOn, TZ))
+bool inOr = not na(time(timeframe.period, sessOr, TZ))
+bool onStart = inOn and not inOn[1]
+bool rthStart = inRth and not inRth[1]
+int barsSinceOn = ta.barssince(onStart)
+bool dayRoll = onStart or (rthStart and (na(barsSinceOn) or barsSinceOn > 300))
+
+// ---------------------------------------------------------------- core market facts
+float atr = ta.atr(14)
+float ema20 = ta.ema(close, 20)
+float emaSlope = atr > 0 ? (ema20 - ema20[5]) / atr : 0.0
+float path6 = math.sum(math.abs(close - close[1]), 6)
+float eff6 = path6 > 0 ? (close - close[6]) / path6 : 0.0
+float path12 = math.sum(math.abs(close - close[1]), 12)
+float eff12 = path12 > 0 ? math.abs(close - close[12]) / path12 : 0.0
+float volSma = ta.sma(volume, 20)
+float hh10 = ta.highest(high, 10)
+float ll10 = ta.lowest(low, 10)
+float hh3 = ta.highest(high, 3)
+float ll3 = ta.lowest(low, 3)
+float prevClose = close[1]
+
+// ---------------------------------------------------------------- session levels
+var float rthH = na
+var float rthL = na
+var float rthC = na
+var float pdh = na
+var float pdl = na
+var float pdc = na
+var float onh = na
+var float onl = na
+var float onOpen = na
+var float orh = na
+var float orl = na
+var float vwapNum = 0.0
+var float vwapDen = 0.0
+
+// daily guard state
+var int tradesToday = 0
+var int lossesToday = 0
+var float dayPnl = 0.0
+var string usedKeys = ""
+
+if dayRoll
+    if not na(rthH)
+        pdh := rthH
+        pdl := rthL
+        pdc := rthC
+    rthH := na
+    rthL := na
+    rthC := na
+    tradesToday := 0
+    lossesToday := 0
+    dayPnl := 0.0
+    usedKeys := ""
+if onStart
+    onh := high
+    onl := low
+    onOpen := open
+else if inOn
+    onh := na(onh) ? high : math.max(onh, high)
+    onl := na(onl) ? low : math.min(onl, low)
+if rthStart
+    vwapNum := 0.0
+    vwapDen := 0.0
+    orh := na
+    orl := na
+if inRth
+    rthH := na(rthH) ? high : math.max(rthH, high)
+    rthL := na(rthL) ? low : math.min(rthL, low)
+    rthC := close
+    vwapNum += hlc3 * volume
+    vwapDen += volume
+if inOr
+    orh := na(orh) ? high : math.max(orh, high)
+    orl := na(orl) ? low : math.min(orl, low)
+
+bool orDone = inRth and not inOr and not na(orh)
+float rthVwap = inRth and vwapDen > 0 ? vwapNum / vwapDen : na
+array<float> lv = array.from(pdh, pdl, pdc, inRth ? onh : na, inRth ? onl : na, orDone ? orh : na, orDone ? orl : na, rthVwap)
+array<string> ln = array.from("PDH", "PDL", "PDC", "ONH", "ONL", "ORH", "ORL", "VWAP")
+
+// ---------------------------------------------------------------- premarket / day plan
+var int pmBias = 0
+var string pmTxt = "waiting for 06:30"
+if rthStart
+    float onMove = na(onOpen) ? 0.0 : prevClose - onOpen
+    int onDir = onMove > 0.5 * atr ? 1 : onMove < -0.5 * atr ? -1 : 0
+    string loc = na(pdh) ? "no prior day yet" : open > pdh ? "ABOVE prior-day high" : open < pdl ? "BELOW prior-day low" : "inside prior-day range"
+    pmBias := not na(pdh) and open > pdh and onDir >= 0 ? 1 : not na(pdl) and open < pdl and onDir <= 0 ? -1 : math.abs(onMove) > 1.5 * atr ? onDir : 0
+    pmTxt := "Opened " + loc + "\novernight " + (onDir == 1 ? "UP " : onDir == -1 ? "DOWN " : "flat ") + f_pts(onMove) + " pts (range " + f_pts(onh - onl) + ")"
+
+int liveBias = pmBias
+string biasWhy = "premarket"
+if orDone and not na(rthVwap)
+    if close > orh and close > rthVwap
+        liveBias := 1
+        biasWhy := "accepted ABOVE opening range + VWAP"
+    else if close < orl and close < rthVwap
+        liveBias := -1
+        biasWhy := "accepted BELOW opening range + VWAP"
+    else
+        biasWhy := "inside opening range → keep premarket plan"
+string planTxt = (liveBias == 1 ? "favor LONGS" : liveBias == -1 ? "favor SHORTS" : "two-sided / rotate") + " (" + biasWhy + ")"
+
+// ---------------------------------------------------------------- relative volume (same 5m slot on prior days)
+var map<int, float> slotAvg = map.new<int, float>()
+var map<int, int> slotCnt = map.new<int, int>()
+int slotKey = hour(time, TZ) * 60 + minute(time, TZ)
+float prevSlot = slotAvg.contains(slotKey) ? slotAvg.get(slotKey) : na
+int prevCnt = slotCnt.contains(slotKey) ? slotCnt.get(slotKey) : 0
+bool slotReady = prevCnt >= 5 and prevSlot > 0
+float rvol = slotReady ? volume / prevSlot : (volSma > 0 ? volume / volSma : 1.0)
+if barstate.isconfirmed
+    float a = 2.0 / (slotDays + 1)
+    slotAvg.put(slotKey, na(prevSlot) ? volume : prevSlot + a * (volume - prevSlot))
+    slotCnt.put(slotKey, prevCnt + 1)
+
+// ---------------------------------------------------------------- structure
+float ph = ta.pivothigh(high, 3, 3)
+float pl = ta.pivotlow(low, 3, 3)
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+if not na(ph)
+    prevPH := lastPH
+    lastPH := ph
+if not na(pl)
+    prevPL := lastPL
+    lastPL := pl
+bool structUp = not na(prevPH) and not na(prevPL) and lastPH > prevPH and lastPL > prevPL and close > lastPL
+bool structDn = not na(prevPH) and not na(prevPL) and lastPH < prevPH and lastPL < prevPL and close < lastPH
+
+// ---------------------------------------------------------------- market state (the "read")
+float refV = na(rthVwap) ? ema20 : rthVwap
+int bullVotes = (close > refV ? 1 : 0) + (emaSlope > 0.12 ? 1 : 0) + (structUp ? 1 : 0) + (eff6 > 0.25 ? 1 : 0)
+int bearVotes = (close < refV ? 1 : 0) + (emaSlope < -0.12 ? 1 : 0) + (structDn ? 1 : 0) + (eff6 < -0.25 ? 1 : 0)
+
+var int trendDir = 0
+if bullVotes >= 3 and bearVotes <= 1
+    trendDir := 1
+else if bearVotes >= 3 and bullVotes <= 1
+    trendDir := -1
+else if trendDir == 1 and ((not na(lastPL) and close < lastPL) or emaSlope < -0.05)
+    trendDir := 0
+else if trendDir == -1 and ((not na(lastPH) and close > lastPH) or emaSlope > 0.05)
+    trendDir := 0
+
+bool rangeCond = eff12 < 0.3 and math.abs(emaSlope) < 0.15
+int mState = trendDir == 1 ? ST_UP : trendDir == -1 ? ST_DN : rangeCond ? ST_RANGE : ST_MIXED
+bool extendedUp = close - ema20 > 2.0 * atr
+bool extendedDn = ema20 - close > 2.0 * atr
+
+string stateTxt = mState == ST_UP ? "TREND UP" : mState == ST_DN ? "TREND DOWN" : mState == ST_RANGE ? "RANGE" : "MIXED / CHOP"
+string structTxt = structUp ? "HH/HL" : structDn ? "LH/LL" : "mixed"
+string readTxt = "VWAP " + (close > refV ? "above" : "below") + " · EMA slope " + f_pts(emaSlope) + " · structure " + structTxt + " · eff " + f_pts(eff6) + " · ATR " + f_pts(atr)
+
+// ---------------------------------------------------------------- candle facts
+float rng = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float closeLoc = (close - low) / rng
+float lowerWick = math.min(open, close) - low
+float upperWick = high - math.max(open, close)
+float tol = levelTolAtr * atr
+
+// ---------------------------------------------------------------- candle story (sub-candles inside this 5m candle)
+[sO, sH, sL, sC, sV] = request.security_lower_tf(syminfo.tickerid, subTf, [open, high, low, close, volume])
+int sn = sC.size()
+bool storyHas = sn >= 2
+int storyBull = 0
+int storyBear = 0
+string storyTxt = "no sub-candle data"
+if storyHas
+    int iHi = sH.indexof(sH.max())
+    int iLo = sL.indexof(sL.min())
+    float firstMove = sC.get(0) - sO.get(0)
+    float lastMove = sC.get(sn - 1) - sO.get(sn - 1)
+    float lastVol = sV.get(sn - 1)
+    float avgVol = sV.avg()
+    int half = math.floor(sn / 2)
+    float lateUp = 0.0
+    float lateDn = 0.0
+    for j = half to sn - 1
+        float mv = sC.get(j) - sO.get(j)
+        if mv > 0
+            lateUp += sV.get(j)
+        else if mv < 0
+            lateDn += sV.get(j)
+    bool lowFirst = iLo < iHi
+    bool closePushUp = lastMove > 0 and lastVol >= 0.8 * avgVol
+    bool closePushDn = lastMove < 0 and lastVol >= 0.8 * avgVol
+    // 1) sequence: low printed before high → buyers finished the candle
+    storyBull += lowFirst ? 1 : 0
+    storyBear += not lowFirst and iLo != iHi ? 1 : 0
+    // 2) who controlled the closing minute
+    storyBull += closePushUp ? 1 : 0
+    storyBear += closePushDn ? 1 : 0
+    // 3) who won the second half (volume on up vs down sub-candles)
+    storyBull += lateUp > 1.2 * lateDn ? 1 : 0
+    storyBear += lateDn > 1.2 * lateUp ? 1 : 0
+    // 4) where the 5m candle closed
+    storyBull += closeLoc >= 0.65 ? 1 : 0
+    storyBear += closeLoc <= 0.35 ? 1 : 0
+    // 5) the side that pushed FIRST lost (fakeout / absorption)
+    storyBull += firstMove < 0 and close > open ? 1 : 0
+    storyBear += firstMove > 0 and close < open ? 1 : 0
+    storyTxt := "first push " + (firstMove > 0 ? "UP" : firstMove < 0 ? "DOWN" : "flat") + " · " + (lowFirst ? "low first, high later" : "high first, low later") + " · close push " + (closePushUp ? "BUYERS" : closePushDn ? "SELLERS" : "weak") + "\n2nd half " + (lateUp > 1.2 * lateDn ? "buyers" : lateDn > 1.2 * lateUp ? "sellers" : "even") + " → bull " + str.tostring(storyBull) + "/5 · bear " + str.tostring(storyBear) + "/5"
+
+// ---------------------------------------------------------------- footprint: who is stronger (exactly one request.footprint call)
+footprint fp = request.footprint(fpTicks, 70, fpImbPct)
+bool fpHas = useFp and not na(fp)
+float fpDelta = na
+float fpDeltaPct = na
+int buyStack = 0
+int sellStack = 0
+float lowDelta = 0.0
+float lowVol = 0.0
+float highDelta = 0.0
+float highVol = 0.0
+if fpHas
+    float fpTot = fp.total_volume()
+    fpDelta := fp.delta()
+    fpDeltaPct := fpTot > 0 ? fpDelta / fpTot : 0.0
+    array<volume_row> rows = fp.rows()
+    int runB = 0
+    int runS = 0
+    float third = (high - low) / 3.0
+    for r in rows
+        runB := r.has_buy_imbalance() ? runB + 1 : 0
+        runS := r.has_sell_imbalance() ? runS + 1 : 0
+        buyStack := math.max(buyStack, runB)
+        sellStack := math.max(sellStack, runS)
+        float mid = math.avg(r.up_price(), r.down_price())
+        if mid <= low + third
+            lowDelta += r.delta()
+            lowVol += r.total_volume()
+        else if mid >= high - third
+            highDelta += r.delta()
+            highVol += r.total_volume()
+
+var float cvd = 0.0
+if rthStart
+    cvd := 0.0
+if fpHas and inRth
+    cvd += fpDelta
+
+bool absorbLong = fpHas and lowVol > 0 and lowDelta < -0.15 * lowVol and closeLoc >= 0.6
+bool absorbShort = fpHas and highVol > 0 and highDelta > 0.15 * highVol and closeLoc <= 0.4
+bool flowLong = not fpHas or fpDeltaPct >= fpMinDelta or buyStack >= 3 or absorbLong
+bool flowShort = not fpHas or fpDeltaPct <= -fpMinDelta or sellStack >= 3 or absorbShort
+string flowTxt = not fpHas ? "footprint n/a" : "delta " + str.tostring(fpDeltaPct * 100, "#") + "% · CVD " + str.tostring(cvd, "#") + " · stacked imb B" + str.tostring(buyStack) + "/S" + str.tostring(sellStack) + (absorbLong ? " · sellers ABSORBED at low" : absorbShort ? " · buyers ABSORBED at high" : "")
+
+// ---------------------------------------------------------------- trade bookkeeping
+var int pendDir = 0
+var int pendBar = 0
+var int activeDir = 0
+var bool tp1Done = false
+var float planEntry = na
+var float planStop = na
+var float planTp1 = na
+var float planTp2 = na
+var float runStop = na
+var float npMark = 0.0
+var int lastExitBar = -1000
+var string lastSignal = "—"
+var string lastResult = "—"
+
+bool posNow = strategy.position_size != 0
+int q1 = math.min(qtyTp1, qtyTotal)
+
+// fill detection (also catches same-bar round trips via netprofit change)
+if pendDir != 0 and (posNow or strategy.netprofit != npMark)
+    tradesToday += 1
+    activeDir := pendDir
+    pendDir := 0
+    tp1Done := false
+    planEntry := posNow ? strategy.position_avg_price : planEntry
+    planTp1 := planEntry + activeDir * tp1Pts
+    planTp2 := planEntry + activeDir * tp2Pts
+    runStop := planStop
+
+if posNow and not tp1Done and q1 > 0 and q1 < qtyTotal and math.abs(strategy.position_size) < qtyTotal
+    tp1Done := true
+    if beAfterTp1
+        runStop := planEntry
+
+// settle when flat
+if not posNow and (activeDir != 0 or strategy.netprofit != npMark)
+    float d = strategy.netprofit - npMark
+    if d != 0
+        dayPnl += d
+        if d < 0
+            lossesToday += 1
+        lastResult := (d >= 0 ? "+$" : "-$") + str.tostring(math.abs(d), "#") + (tp1Done ? " (TP1 hit)" : "")
+    npMark := strategy.netprofit
+    activeDir := 0
+    tp1Done := false
+    lastExitBar := bar_index
+    planEntry := na
+    planStop := na
+    planTp1 := na
+    planTp2 := na
+    runStop := na
+
+// pending expiry (stop entries only)
+if pendDir != 0 and not posNow and bar_index - pendBar >= entryExpiry
+    strategy.cancel(pendDir == 1 ? "L" : "S")
+    pendDir := 0
+    planEntry := na
+    planStop := na
+    planTp1 := na
+    planTp2 := na
+    lastSignal := lastSignal + " · expired"
+
+// force flat / end of window
+if hhmm >= flatHHMM and hhmm < 1500
+    if pendDir != 0
+        strategy.cancel_all()
+        pendDir := 0
+    if posNow
+        strategy.close_all(comment="EOD flat", immediately=true)
+
+// guard
+string guardTxt = ""
+if tradesToday >= maxTrades
+    guardTxt := "Max trades (" + str.tostring(maxTrades) + ") reached"
+else if lossesToday >= maxLosses
+    guardTxt := str.tostring(lossesToday) + " losses today — done"
+else if maxDayLoss > 0 and dayPnl <= -maxDayLoss
+    guardTxt := "Day loss limit hit"
+bool guardOk = guardTxt == ""
+bool cooled = bar_index - lastExitBar >= cooldownBars
+bool canSignal = inTrade and hhmm <= lastEntryHHMM and guardOk and cooled and not posNow and pendDir == 0 and atr > 0
+
+// ---------------------------------------------------------------- breakout claims (tracked every bar)
+var float bUpLvl = na
+var string bUpName = ""
+var int bUpBar = 0
+var float bUpExt = na
+var float bDnLvl = na
+var string bDnName = ""
+var int bDnBar = 0
+var float bDnExt = na
+
+bool retestLong = false
+bool retestShort = false
+bool trapLong = false
+bool trapShort = false
+string evName = ""
+float evStop = na
+
+if not na(bUpLvl)
+    int ageU = bar_index - bUpBar
+    bUpExt := math.max(bUpExt, high)
+    if ageU > 8
+        bUpLvl := na
+    else if close < bUpLvl - 0.1 * atr and ageU <= 4
+        trapShort := true
+        evName := bUpName
+        evStop := bUpExt + stopBuf
+        bUpLvl := na
+    else if ageU >= 1 and low <= bUpLvl + tol and close > bUpLvl and close > open and closeLoc >= 0.5
+        retestLong := true
+        evName := bUpName
+        evStop := low - stopBuf
+        bUpLvl := na
+
+if not na(bDnLvl)
+    int ageD = bar_index - bDnBar
+    bDnExt := math.min(bDnExt, low)
+    if ageD > 8
+        bDnLvl := na
+    else if close > bDnLvl + 0.1 * atr and ageD <= 4
+        trapLong := true
+        evName := bDnName
+        evStop := bDnExt - stopBuf
+        bDnLvl := na
+    else if ageD >= 1 and high >= bDnLvl - tol and close < bDnLvl and close < open and closeLoc <= 0.5
+        retestShort := true
+        evName := bDnName
+        evStop := high + stopBuf
+        bDnLvl := na
+
+if inTrade and atr > 0 and rvol >= rvolBreak and body >= 0.5 * rng
+    if na(bUpLvl) and closeLoc >= 0.7
+        float bestU = na
+        string bestUN = ""
+        for i = 0 to lv.size() - 1
+            float v = lv.get(i)
+            if not na(v) and open < v and close > v + 0.15 * atr and (na(bestU) or v > bestU)
+                bestU := v
+                bestUN := ln.get(i)
+        if not na(bestU)
+            bUpLvl := bestU
+            bUpName := bestUN
+            bUpBar := bar_index
+            bUpExt := high
+    if na(bDnLvl) and closeLoc <= 0.3
+        float bestD = na
+        string bestDN = ""
+        for i = 0 to lv.size() - 1
+            float v = lv.get(i)
+            if not na(v) and open > v and close < v - 0.15 * atr and (na(bestD) or v < bestD)
+                bestD := v
+                bestDN := ln.get(i)
+        if not na(bestD)
+            bDnLvl := bestD
+            bDnName := bestDN
+            bDnBar := bar_index
+            bDnExt := low
+
+// ---------------------------------------------------------------- level rejection candidates
+bool rejLong = false
+bool rejShort = false
+string rjName = ""
+bool rjSwept = false
+
+if useRejection and mState != ST_DN
+    float bestV = na
+    string bestN = ""
+    for i = 0 to lv.size() - 1
+        float v = lv.get(i)
+        if not na(v) and low <= v + tol and close > v and (na(bestV) or math.abs(low - v) < math.abs(low - bestV))
+            bestV := v
+            bestN := ln.get(i)
+    if not na(bestV)
+        bool swept = low < bestV - 2 * syminfo.mintick
+        bool hand = closeLoc >= 0.6 and lowerWick >= 0.4 * rng and rvol >= rvolLevel
+        if hand and (mState != ST_MIXED or swept)
+            rejLong := true
+            rjName := bestN
+            rjSwept := swept
+
+if useRejection and mState != ST_UP and not rejLong
+    float bestV = na
+    string bestN = ""
+    for i = 0 to lv.size() - 1
+        float v = lv.get(i)
+        if not na(v) and high >= v - tol and close < v and (na(bestV) or math.abs(high - v) < math.abs(high - bestV))
+            bestV := v
+            bestN := ln.get(i)
+    if not na(bestV)
+        bool swept = high > bestV + 2 * syminfo.mintick
+        bool hand = closeLoc <= 0.4 and upperWick >= 0.4 * rng and rvol >= rvolLevel
+        if hand and (mState != ST_MIXED or swept)
+            rejShort := true
+            rjName := bestN
+            rjSwept := swept
+
+// ---------------------------------------------------------------- trend pullback candidates
+bool pbLong = false
+bool pbShort = false
+if usePullback and mState == ST_UP and not extendedUp
+    float valueZ = math.max(ema20, refV)
+    bool pulled = low <= valueZ + 0.25 * atr and hh10 - low >= 0.6 * atr
+    bool structOk = na(lastPL) or low > lastPL
+    bool hand = close > open and closeLoc >= 0.6 and rvol >= rvolPull and close > valueZ - 0.1 * atr
+    pbLong := pulled and structOk and hand
+if usePullback and mState == ST_DN and not extendedDn
+    float valueZ = math.min(ema20, refV)
+    bool pulled = high >= valueZ - 0.25 * atr and high - ll10 >= 0.6 * atr
+    bool structOk = na(lastPH) or high < lastPH
+    bool hand = close < open and closeLoc <= 0.4 and rvol >= rvolPull and close < valueZ + 0.1 * atr
+    pbShort := pulled and structOk and hand
+
+// ---------------------------------------------------------------- choose ONE setup (priority: trap > retest > rejection > pullback)
+int sigDir = 0
+string sigType = ""
+string sigName = ""
+string sigKey = ""
+float sigStop = na
+string sigWhy = ""
+
+if useTrap and trapShort and mState != ST_UP
+    sigDir := -1
+    sigType := "TRAP"
+    sigName := "FAILED BREAK ↑ (TRAP) @ " + evName
+    sigKey := evName + "-S"
+    sigStop := evStop
+    sigWhy := "Buyers broke " + evName + " with volume but price closed back below within 4 bars → trapped longs"
+else if useTrap and trapLong and mState != ST_DN
+    sigDir := 1
+    sigType := "TRAP"
+    sigName := "FAILED BREAK ↓ (TRAP) @ " + evName
+    sigKey := evName + "-L"
+    sigStop := evStop
+    sigWhy := "Sellers broke " + evName + " with volume but price closed back above within 4 bars → trapped shorts"
+else if useRetest and retestLong and mState != ST_DN
+    sigDir := 1
+    sigType := "RETEST"
+    sigName := "BREAK + RETEST @ " + evName
+    sigKey := evName + "-L"
+    sigStop := evStop
+    sigWhy := evName + " broke with volume, retest held and buyers closed it up again"
+else if useRetest and retestShort and mState != ST_UP
+    sigDir := -1
+    sigType := "RETEST"
+    sigName := "BREAK + RETEST @ " + evName
+    sigKey := evName + "-S"
+    sigStop := evStop
+    sigWhy := evName + " broke with volume, retest failed and sellers closed it down again"
+else if rejLong
+    sigDir := 1
+    sigType := "LEVEL"
+    sigName := (rjSwept ? "SWEEP + RECLAIM @ " : "REJECTION @ ") + rjName
+    sigKey := rjName + "-L"
+    sigStop := low - stopBuf
+    sigWhy := (rjSwept ? "Swept below " : "Tested ") + rjName + ", long lower wick, closed in upper part on " + f_pts(rvol) + "x volume → buyers defended"
+else if rejShort
+    sigDir := -1
+    sigType := "LEVEL"
+    sigName := (rjSwept ? "SWEEP + RECLAIM @ " : "REJECTION @ ") + rjName
+    sigKey := rjName + "-S"
+    sigStop := high + stopBuf
+    sigWhy := (rjSwept ? "Swept above " : "Tested ") + rjName + ", long upper wick, closed in lower part on " + f_pts(rvol) + "x volume → sellers defended"
+else if pbLong
+    sigDir := 1
+    sigType := "PULLBACK"
+    sigName := "TREND PULLBACK"
+    sigKey := "PB-L-" + str.tostring(lastPL)
+    sigStop := ll3 - stopBuf
+    sigWhy := "Uptrend pulled back to value (VWAP/EMA), structure held, buyers showed up again on " + f_pts(rvol) + "x volume"
+else if pbShort
+    sigDir := -1
+    sigType := "PULLBACK"
+    sigName := "TREND PULLBACK"
+    sigKey := "PB-S-" + str.tostring(lastPH)
+    sigStop := hh3 + stopBuf
+    sigWhy := "Downtrend pulled back to value (VWAP/EMA), structure held, sellers showed up again on " + f_pts(rvol) + "x volume"
+
+// context of this signal: day-plan alignment + story strength
+int storyMine = sigDir == 1 ? storyBull : storyBear
+bool storyOk = not storyHas or storyMine >= minStory
+string align = liveBias == 0 ? "two-sided" : liveBias == sigDir ? "WITH plan" : "AGAINST plan"
+string ctxKey = sigType + "|" + align + "|" + (storyOk ? "strong story" : "weak story")
+
+// ---------------------------------------------------------------- learning: shadow trades (walk-forward, resolved outcomes only)
+var map<string, int> shW = map.new<string, int>()
+var map<string, int> shN = map.new<string, int>()
+var array<float> shStop = array.new<float>()
+var array<float> shTp = array.new<float>()
+var array<int> shDir = array.new<int>()
+var array<int> shBar = array.new<int>()
+var array<string> shKey = array.new<string>()
+var int shTotW = 0
+var int shTotN = 0
+
+if shDir.size() > 0
+    for k = shDir.size() - 1 to 0
+        int dk = shDir.get(k)
+        bool hitStop = dk == 1 ? low <= shStop.get(k) : high >= shStop.get(k)
+        bool hitTp = dk == 1 ? high >= shTp.get(k) : low <= shTp.get(k)
+        bool expired = bar_index - shBar.get(k) > shadowBars
+        if bar_index > shBar.get(k) and (hitStop or hitTp or expired)
+            string kk = shKey.get(k)
+            bool won = hitTp and not hitStop
+            shN.put(kk, f_mapInt(shN, kk) + 1)
+            shTotN += 1
+            if won
+                shW.put(kk, f_mapInt(shW, kk) + 1)
+                shTotW += 1
+            shStop.remove(k)
+            shTp.remove(k)
+            shDir.remove(k)
+            shBar.remove(k)
+            shKey.remove(k)
+
+int ctxN = f_mapInt(shN, ctxKey)
+int ctxW = f_mapInt(shW, ctxKey)
+float ctxWr = ctxN > 0 ? 100.0 * ctxW / ctxN : na
+string learnTxt = ctxN == 0 ? "no history yet for: " + ctxKey : ctxKey + " → " + str.tostring(ctxW) + "W/" + str.tostring(ctxN - ctxW) + "L (" + str.tostring(ctxWr, "#") + "%)"
+bool learnOk = not useLearning or (ctxN >= learnMinN ? ctxWr >= learnMinWr : tradeUnproven)
+
+bool candNow = sigDir != 0 and inTrade and hhmm <= lastEntryHHMM
+
+// ---------------------------------------------------------------- research mode: snapshot the market every bar → did price go +X or -X first?
+f_r(float x) => na(x) ? "na" : str.tostring(x, "#.##")
+float cvdChg = cvd - cvd[6]
+[raP, raN] = f_nearestAbove(lv, ln, close + syminfo.mintick)
+[rbP, rbN] = f_nearestBelow(lv, ln, close - syminfo.mintick)
+string feat = "h" + str.tostring(hhmm) + "|st" + str.tostring(mState) + "|bv" + str.tostring(bullVotes) + "|bb" + str.tostring(bearVotes) + "|pl" + str.tostring(liveBias) + "|pm" + str.tostring(pmBias) + "|vw" + f_r(na(rthVwap) ? na : (close - rthVwap) / atr) + "|or" + f_r(orDone and orh > orl ? (close - orl) / (orh - orl) : na) + "|dh" + f_r((close - pdh) / atr) + "|dl" + f_r((close - pdl) / atr) + "|oh" + f_r((close - onh) / atr) + "|ol" + f_r((close - onl) / atr) + "|ra" + f_r(raP - close) + "|rb" + f_r(close - rbP) + "|rv" + f_r(rvol) + "|sb" + str.tostring(storyBull) + "|sr" + str.tostring(storyBear) + "|fd" + f_r(nz(fpDeltaPct) * 100) + "|cv" + f_r(cvdChg) + "|ab" + str.tostring(absorbLong ? 1 : absorbShort ? -1 : 0) + "|ks" + str.tostring(buyStack - sellStack) + "|e6" + f_r(eff6) + "|e12" + f_r(eff12) + "|sl" + f_r(emaSlope) + "|su" + str.tostring(structUp ? 1 : structDn ? -1 : 0) + "|cl" + f_r(closeLoc) + "|at" + f_r(atr)
+var int rBar = 0
+if researchMode
+    if strategy.position_size != 0 and bar_index - rBar >= researchBars
+        strategy.close_all(comment="T0")
+    if strategy.position_size == 0 and inTrade and hhmm <= lastEntryHHMM and atr > 0
+        strategy.entry("R", strategy.long, qty=1, comment=feat)
+        strategy.exit("RX", "R", stop=close - researchMove, limit=close + researchMove, comment_profit="UP", comment_loss="DN")
+        rBar := bar_index
+if candNow and shDir.size() < 300
+    float shEntry = close
+    float sStop = sigDir == 1 ? math.min(sigStop, shEntry - minStop) : math.max(sigStop, shEntry + minStop)
+    shStop.push(sStop)
+    shTp.push(shEntry + sigDir * tp1Pts)
+    shDir.push(sigDir)
+    shBar.push(bar_index)
+    shKey.push(ctxKey)
+
+// ---------------------------------------------------------------- sanity checks + place the order
+var int nCand = 0
+var int nBlocked = 0
+var int nSkipBias = 0
+var int nSkipStory = 0
+var int nSkipLearn = 0
+var int nSkipStop = 0
+var int nSkipRoom = 0
+var int nSkipFlow = 0
+var int nTaken = 0
+if candNow
+    nCand += 1
+    if not canSignal or str.contains(usedKeys, sigKey + ";")
+        nBlocked += 1
+
+if not researchMode and sigDir != 0 and canSignal and not str.contains(usedKeys, sigKey + ";")
+    bool stopEntry = entryMode == "Stop beyond signal candle"
+    float trig = not stopEntry ? close : sigDir == 1 ? high + syminfo.mintick : low - syminfo.mintick
+    float stp = sigStop
+    float risk = sigDir == 1 ? trig - stp : stp - trig
+    if risk < minStop
+        stp := sigDir == 1 ? trig - minStop : trig + minStop
+        risk := minStop
+    [resP, resN] = f_nearestAbove(lv, ln, trig + syminfo.mintick)
+    [supP, supN] = f_nearestBelow(lv, ln, trig - syminfo.mintick)
+    float oppP = sigDir == 1 ? resP : supP
+    string oppN = sigDir == 1 ? resN : supN
+    float room = na(oppP) ? na : math.abs(oppP - trig)
+    bool flowOk = sigDir == 1 ? flowLong : flowShort
+    string skip = ""
+    if useDayBias and liveBias != 0 and liveBias != sigDir
+        skip := "against the day plan (" + planTxt + ")"
+        nSkipBias += 1
+    else if useStory and not storyOk
+        skip := "candle story too weak (" + str.tostring(storyMine) + "/5, need " + str.tostring(minStory) + ")"
+        nSkipStory += 1
+    else if not learnOk
+        skip := ctxN < learnMinN ? "still learning this context (" + str.tostring(ctxN) + "/" + str.tostring(learnMinN) + " samples)" : "this context has not worked (" + str.tostring(ctxWr, "#") + "% < " + str.tostring(learnMinWr, "#") + "%)"
+        nSkipLearn += 1
+    else if risk > maxStop
+        skip := "stop too wide (" + f_pts(risk) + " pts)"
+        nSkipStop += 1
+    else if not na(room) and room < minRoom
+        skip := "no room: " + oppN + " only " + f_pts(room) + " pts away"
+        nSkipRoom += 1
+    else if fpRequire and not flowOk
+        skip := "order flow disagrees (" + flowTxt + ")"
+        nSkipFlow += 1
+    string why = "DAY PLAN: " + planTxt + "\n" + pmTxt + "\n\nMARKET: " + stateTxt + "\n" + readTxt + "\n\nSETUP: " + sigName + "\n" + sigWhy + "\n\nCANDLE STORY: " + storyTxt + "\n\nFLOW: " + flowTxt + "\n\nLEARNED: " + learnTxt + "\n\nRoom: " + (na(room) ? "open (no level ahead)" : oppN + " " + f_pts(room) + " pts")
+    if skip == ""
+        nTaken += 1
+        pendDir := sigDir
+        pendBar := bar_index
+        planEntry := trig
+        planStop := stp
+        planTp1 := trig + sigDir * tp1Pts
+        planTp2 := trig + sigDir * tp2Pts
+        runStop := stp
+        usedKeys += sigKey + ";"
+        strategy.entry(sigDir == 1 ? "L" : "S", sigDir == 1 ? strategy.long : strategy.short, qty=qtyTotal, stop=stopEntry ? trig : na, comment=sigName)
+        string plan = "\n\nPLAN: " + (sigDir == 1 ? "buy" : "sell") + (stopEntry ? " stop " : " next open ≈ ") + f_pts(trig) + " · stop " + f_pts(stp) + " (" + f_pts(risk) + " pts)\nTP1 +" + f_pts(tp1Pts) + " (" + str.tostring(q1) + " ct) · runner +" + f_pts(tp2Pts)
+        label.new(bar_index, sigDir == 1 ? low : high, (sigDir == 1 ? "▲ " : "▼ ") + sigName, style=sigDir == 1 ? label.style_label_up : label.style_label_down, color=sigDir == 1 ? color.new(color.teal, 10) : color.new(color.maroon, 10), textcolor=color.white, size=size.small, tooltip=why + plan)
+        lastSignal := (sigDir == 1 ? "LONG " : "SHORT ") + sigName
+        alert((sigDir == 1 ? "LONG " : "SHORT ") + sigName + " | entry ≈ " + f_pts(trig) + " | stop " + f_pts(stp) + " | TP1 " + f_pts(planTp1) + " | TP2 " + f_pts(planTp2) + " | " + learnTxt, alert.freq_once_per_bar_close)
+    else if showSkips
+        label.new(bar_index, sigDir == 1 ? low : high, "skip", style=sigDir == 1 ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 40), textcolor=color.white, size=size.tiny, tooltip=why + "\n\nSKIPPED: " + skip)
+
+// ---------------------------------------------------------------- exits (re-issued every bar while armed or in a trade)
+int eDir = pendDir != 0 ? pendDir : activeDir
+if eDir != 0 and (pendDir != 0 or strategy.position_size != 0)
+    string eid = eDir == 1 ? "L" : "S"
+    if q1 > 0 and q1 < qtyTotal
+        strategy.exit("TP1", eid, qty=q1, limit=planTp1, stop=planStop, comment_profit="TP1", comment_loss="SL")
+        strategy.exit("RUN", eid, limit=planTp2, stop=runStop, comment_profit="TP2", comment_loss=tp1Done ? "BE" : "SL")
+    else if q1 >= qtyTotal
+        strategy.exit("TP1", eid, limit=planTp1, stop=planStop, comment_profit="TP1", comment_loss="SL")
+    else
+        strategy.exit("RUN", eid, limit=planTp2, stop=runStop, comment_profit="TP2", comment_loss="SL")
+
+// ---------------------------------------------------------------- visuals (no background coloring)
+bool showL = showLevels and inTrade
+plot(showL ? pdh : na, "PDH", color.new(color.red, 20), 1, plot.style_linebr)
+plot(showL ? pdl : na, "PDL", color.new(color.green, 20), 1, plot.style_linebr)
+plot(showL ? pdc : na, "PDC", color.new(color.yellow, 30), 1, plot.style_circles)
+plot(showL ? onh : na, "ONH", color.new(color.fuchsia, 30), 1, plot.style_linebr)
+plot(showL ? onl : na, "ONL", color.new(color.fuchsia, 30), 1, plot.style_linebr)
+plot(showL and orDone ? orh : na, "ORH", color.new(color.silver, 30), 1, plot.style_linebr)
+plot(showL and orDone ? orl : na, "ORL", color.new(color.silver, 30), 1, plot.style_linebr)
+plot(showL ? rthVwap : na, "RTH VWAP", color.new(color.orange, 0), 2, plot.style_linebr)
+plot(ema20, "EMA 20", color.new(color.aqua, 60), 1)
+
+bool planOn = pendDir != 0 or strategy.position_size != 0
+plot(planOn ? planEntry : na, "Entry", color.new(color.white, 20), 1, plot.style_linebr)
+plot(planOn ? (tp1Done ? runStop : planStop) : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)
+plot(planOn and not tp1Done ? planTp1 : na, "TP1", color.new(color.lime, 30), 1, plot.style_linebr)
+plot(planOn ? planTp2 : na, "TP2", color.new(color.lime, 0), 1, plot.style_linebr)
+
+var array<label> tags = array.new<label>()
+if barstate.islast and showL
+    for t in tags
+        label.delete(t)
+    tags.clear()
+    for i = 0 to lv.size() - 1
+        float v = lv.get(i)
+        if not na(v)
+            tags.push(label.new(bar_index + 2, v, ln.get(i) + " " + f_pts(v), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.gray, size=size.tiny))
+
+// ---------------------------------------------------------------- reasoning panel
+string panelPos = panelPosIn == "Top right" ? position.top_right : panelPosIn == "Middle right" ? position.middle_right : panelPosIn == "Bottom right" ? position.bottom_right : panelPosIn == "Top center" ? position.top_center : panelPosIn == "Bottom center" ? position.bottom_center : position.bottom_left
+var table panel = table.new(panelPos, 2, 14, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.new(color.gray, 70))
+if showPanel and barstate.islast
+    [rP, rN] = f_nearestAbove(lv, ln, close)
+    [sP, sN] = f_nearestBelow(lv, ln, close)
+    string watch = ""
+    if not inTrade
+        watch := "Outside NY window — no trades"
+    else if not guardOk
+        watch := "DONE FOR THE DAY: " + guardTxt
+    else if strategy.position_size != 0
+        watch := "IN " + (activeDir == 1 ? "LONG" : "SHORT") + " · open P&L " + str.tostring(strategy.openprofit, "#") + "$" + (tp1Done ? " · TP1 hit, runner at BE" : "")
+    else if pendDir != 0
+        watch := "ARMED " + (pendDir == 1 ? "LONG" : "SHORT") + " · trigger " + f_pts(planEntry)
+    else if hhmm > lastEntryHHMM
+        watch := "Past last-entry time — managing only"
+    else if mState == ST_UP
+        watch := extendedUp ? "Trend up but EXTENDED — don't chase, wait for pullback to VWAP/EMA" : "Trend up — waiting for pullback to value + buyers to show up again"
+    else if mState == ST_DN
+        watch := extendedDn ? "Trend down but EXTENDED — don't chase, wait for pullback to VWAP/EMA" : "Trend down — waiting for pullback to value + sellers to show up again"
+    else if mState == ST_RANGE
+        watch := "Range — only reactions at levels (" + (sN == "" ? "—" : sN) + " / " + (rN == "" ? "—" : rN) + ")"
+    else
+        watch := "Mixed / chop — standing aside unless a level gets swept"
+    if not na(bUpLvl)
+        watch += "\nWatching break of " + bUpName + " (retest or trap)"
+    if not na(bDnLvl)
+        watch += "\nWatching break of " + bDnName + " (retest or trap)"
+    color stCol = mState == ST_UP ? color.teal : mState == ST_DN ? color.maroon : mState == ST_RANGE ? color.gray : color.orange
+    color planCol = liveBias == 1 ? color.teal : liveBias == -1 ? color.maroon : color.gray
+    table.cell(panel, 0, 0, researchMode ? "ASADS NYS v0.3 · RESEARCH" : "ASADS NYS v0.3", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 0, timeframe.period == "5" ? "5m ✓" : "Use 5m chart!", text_color=timeframe.period == "5" ? color.gray : color.orange, text_size=size.small)
+    table.cell(panel, 0, 1, "Day plan", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 1, planTxt, bgcolor=color.new(planCol, 40), text_color=color.white, text_size=size.small)
+    table.cell(panel, 0, 2, "Premarket", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 2, pmTxt, text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 3, "Market", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 3, stateTxt + "  (bull " + str.tostring(bullVotes) + " / bear " + str.tostring(bearVotes) + ")\n" + readTxt, bgcolor=color.new(stCol, 40), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 4, "Candle story", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 4, storyTxt, text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 5, "Volume / flow", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 5, f_pts(rvol) + "x " + (slotReady ? "same-time" : "20-bar") + "\n" + flowTxt, text_color=rvol >= rvolLevel ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(panel, 0, 6, "Levels", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 6, "R: " + (rN == "" ? "none" : rN + " +" + f_pts(rP - close)) + " · S: " + (sN == "" ? "none" : sN + " -" + f_pts(close - sP)), text_color=color.white, text_size=size.small)
+    table.cell(panel, 0, 7, "Thinking", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 7, watch, text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 0, 8, "Last", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 8, lastSignal + " · " + lastResult, text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 9, "Today", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 9, str.tostring(tradesToday) + "/" + str.tostring(maxTrades) + " trades · " + str.tostring(lossesToday) + " L · " + (dayPnl >= 0 ? "+$" : "-$") + str.tostring(math.abs(dayPnl), "#") + (guardOk ? "" : " · " + guardTxt), text_color=dayPnl >= 0 ? color.lime : color.red, text_size=size.small)
+    int proven = 0
+    for key in shN.keys()
+        int nK = f_mapInt(shN, key)
+        if nK >= learnMinN and 100.0 * f_mapInt(shW, key) / nK >= learnMinWr
+            proven += 1
+    table.cell(panel, 0, 10, "Learning", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 10, str.tostring(shTotN) + " shadow trades · " + (shTotN > 0 ? str.tostring(100.0 * shTotW / shTotN, "#") : "—") + "% hit TP1 first\n" + str.tostring(proven) + " proven contexts", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 11, "Setups seen", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 11, str.tostring(nCand) + " · taken " + str.tostring(nTaken) + " · guard/dup " + str.tostring(nBlocked), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 12, "Filtered by", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 12, "plan " + str.tostring(nSkipBias) + " · story " + str.tostring(nSkipStory) + " · learning " + str.tostring(nSkipLearn) + "\n" + "stop " + str.tostring(nSkipStop) + " · room " + str.tostring(nSkipRoom) + " · flow " + str.tostring(nSkipFlow), text_color=color.white, text_size=size.tiny)

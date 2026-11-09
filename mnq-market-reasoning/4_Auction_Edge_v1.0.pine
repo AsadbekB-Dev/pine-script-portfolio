@@ -1,0 +1,601 @@
+//@version=6
+// @strategy_alert_message {{strategy.order.alert_message}}
+strategy("ASADS Auction Edge v1.0", shorttitle="AUCTION EDGE v1.0", overlay=true,
+     pyramiding=0, initial_capital=100000,
+     default_qty_type=strategy.fixed, default_qty_value=2,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.62,
+     slippage=1, calc_on_every_tick=false, calc_on_order_fills=false,
+     process_orders_on_close=false, use_bar_magnifier=true,
+     max_labels_count=300, max_lines_count=120, max_bars_back=500)
+
+// ============================================================================
+// ASADS AUCTION EDGE v1.0
+//
+// WHAT THIS IS
+// A standalone, self-contained strategy built from what the Bot2 / Universal
+// Eyes research actually proved, with everything that did NOT prove removed.
+//
+// EVIDENCE IT IS BUILT ON
+// • Bot2 exports (MNQ, 2023–2026, ~1000 trades/version): the profit came from
+//   FAILED AUCTIONS at mapped levels. The 60+ reasoning tags (regime, HTF,
+//   cross-market, footprint...) only shifted win rate a few points either way.
+// • Bot2 EARLY / FTL thesis-failure exits: ~41% of trades at ~30% win rate and
+//   −0.2R average. They cut winners as often as losers. → NO discretionary exits.
+// • Bot2 capped every winner at 1.25R. → TP1 + runner to the next liquidity.
+// • Prototype tested bar-by-bar on 10 futures markets (NQ ES YM RTY GC CL SI ZN
+//   6E HG, 5m, 60 days, conservative fills, no costs): positive on 10/10 markets,
+//   stable across both halves of the sample.
+//     - Fades only work at EXTERNAL liquidity (prior day / overnight / prior
+//       week extremes). Fading intraday swings / opening range lost money.
+//     - Break-and-retest works when the breakout was an INITIATIVE move
+//       (strong-bodied bar). Drifting breaks are noise.
+//     - Fade entries are better as a LIMIT back at the swept level than as a
+//       stop chasing the reversal bar.
+//
+// TWO SETUPS, ONE LEVEL MAP
+//  1) FADE (failed auction): price sweeps an external level, cannot accept
+//     beyond it, and closes back inside with a rejection close.
+//     → limit entry back at the level, stop beyond the sweep extreme.
+//  2) RETEST (accepted auction): an initiative breakout gets two closes beyond a
+//     level, then the first pullback tags the level and holds.
+//     → stop entry through the hold bar, stop beyond the level / hold bar.
+//
+// MANAGEMENT (identical for both)
+//  • TP1 = 1R on half the position → stop moves to breakeven(+) on the runner.
+//  • Runner targets the next opposing liquidity level (1.75R–4R), else 2.5R.
+//  • No thesis-failure exits. Hard flatten before the cash close.
+//  • Max trades / max full losses per day.
+//
+// HONEST EXPECTATIONS
+//  Prototype per-POSITION win rate ≈ 53% (TP1 reached), PF ≈ 1.3, avg ≈ +0.13R.
+//  TradingView's "Percent profitable" will read higher (≈ 65–70%) because each
+//  partial exit is listed as its own trade. The panel shows the per-position
+//  numbers so you are not fooled by that. Validate in Strategy Tester on your
+//  full MNQ history before trusting it with money.
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+string G_SESS = "1. Session (Pacific)"
+string TZ = input.string("America/Los_Angeles", "Timezone", group=G_SESS)
+string rthSess = input.session("0630-1300", "Cash session (RTH)", group=G_SESS)
+string onSess = input.session("1500-0630", "Overnight session", group=G_SESS)
+int entryStartHHMM = input.int(635, "First entry time (HHMM)", 0, 2359, group=G_SESS)
+int entryEndHHMM = input.int(1230, "Last entry time (HHMM)", 0, 2359, group=G_SESS)
+int flattenHHMM = input.int(1255, "Flatten time (HHMM)", 0, 2359, group=G_SESS)
+int orMins = input.int(30, "Opening range minutes", 5, 90, group=G_SESS)
+
+string G_LVL = "2. Liquidity Levels"
+bool usePD = input.bool(true, "Prior day RTH high / low (external)", group=G_LVL)
+bool useON = input.bool(true, "Overnight high / low (external)", group=G_LVL)
+bool usePW = input.bool(true, "Prior week high / low (external)", group=G_LVL)
+bool useOR = input.bool(true, "Opening range high / low (internal)", group=G_LVL)
+bool useSwings = input.bool(true, "Recent swing pivots (internal)", group=G_LVL)
+int pivLeft = input.int(10, "Swing pivot left bars", 3, 30, group=G_LVL)
+int pivRight = input.int(3, "Swing pivot confirmation bars", 1, 10, group=G_LVL)
+float mergeAtr = input.float(0.15, "Merge nearby levels · ATR", 0.05, 0.50, step=0.01, group=G_LVL)
+
+string G_SET = "3. Setups"
+bool useFade = input.bool(true, "FADE · failed auction", group=G_SET)
+bool fadeExtOnly = input.bool(true, "FADE only at external levels", group=G_SET,
+     tooltip="Research: fades at prior-day / overnight / prior-week extremes were positive on 8/10 markets; fades at intraday swings and the opening range lost money.")
+bool useRetest = input.bool(true, "RETEST · accepted breakout", group=G_SET)
+float retestImpulse = input.float(0.80, "RETEST breakout body ≥ · ATR", 0.0, 2.0, step=0.05, group=G_SET,
+     tooltip="The breakout must contain a strong-bodied bar. Edge rose steadily from 0 → 1.1 ATR in research; 0.8 was positive on 10/10 markets.")
+int retestBars = input.int(15, "RETEST window after acceptance · bars", 3, 40, group=G_SET)
+float penAtr = input.float(0.04, "Sweep minimum penetration · ATR", 0.0, 0.5, step=0.01, group=G_SET)
+float maxPenAtr = input.float(0.90, "Sweep maximum penetration · ATR", 0.2, 2.0, step=0.05, group=G_SET,
+     tooltip="Deeper than this is treated as acceptance, not a failed auction.")
+float acceptAtr = input.float(0.10, "Acceptance buffer · ATR", 0.02, 0.40, step=0.01, group=G_SET)
+float closePosMax = input.float(0.50, "Rejection close position", 0.2, 0.8, step=0.05, group=G_SET,
+     tooltip="FADE short needs the signal bar to close in the lower X of its range (long: upper X).")
+float touchAtr = input.float(0.15, "RETEST touch tolerance · ATR", 0.02, 0.50, step=0.01, group=G_SET)
+bool impulseGuard = input.bool(true, "Don't fade a runaway impulse", group=G_SET)
+float impulseAtrMax = input.float(3.0, "Runaway impulse · 6-bar move ATR", 1.5, 6.0, step=0.25, group=G_SET)
+int armBars = input.int(1, "Order valid for · bars", 1, 5, group=G_SET)
+
+string G_RISK = "4. Risk & Exits"
+int contracts = input.int(2, "Contracts (min 2 for TP1 split)", 2, 100, group=G_RISK)
+float stopBufAtr = input.float(0.10, "Stop buffer beyond structure · ATR", 0.02, 0.50, step=0.01, group=G_RISK)
+float minRiskAtr = input.float(0.30, "Minimum risk · ATR", 0.10, 1.0, step=0.05, group=G_RISK)
+float maxRiskAtr = input.float(1.75, "Maximum risk · ATR", 0.50, 4.0, step=0.05, group=G_RISK)
+float minRoomR = input.float(0.80, "Minimum room to next opposing level · R", 0.0, 3.0, step=0.05, group=G_RISK)
+float tp1R = input.float(1.00, "TP1 · R", 0.40, 3.0, step=0.05, group=G_RISK)
+float tp1Pct = input.float(50, "TP1 size · % of position", 10, 90, step=5, group=G_RISK)
+float runMinR = input.float(1.75, "Runner · nearest level at least · R", 1.0, 4.0, step=0.25, group=G_RISK)
+float runMaxR = input.float(4.00, "Runner · cap · R", 1.5, 8.0, step=0.25, group=G_RISK)
+float runDefR = input.float(2.50, "Runner · default when no level · R", 1.0, 6.0, step=0.25, group=G_RISK)
+float beR = input.float(0.05, "Runner stop after TP1 · R past entry", -0.5, 0.5, step=0.05, group=G_RISK)
+
+string G_DAY = "5. Daily Guards"
+int maxTrades = input.int(4, "Max entries per day", 1, 20, group=G_DAY)
+int maxLosses = input.int(2, "Stop after N full losses", 1, 10, group=G_DAY)
+
+string G_VIS = "6. Display"
+bool showLevels = input.bool(true, "Show level map", group=G_VIS)
+bool showSignals = input.bool(true, "Show setup labels", group=G_VIS)
+bool showTrade = input.bool(true, "Show entry / stop / targets", group=G_VIS)
+bool showPanel = input.bool(true, "Show panel", group=G_VIS)
+float levelRadiusAtr = input.float(8.0, "Draw levels within · ATR", 2.0, 30.0, step=0.5, group=G_VIS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE SERIES
+// ─────────────────────────────────────────────────────────────────────────────
+float atr = ta.atr(14)
+float tick = syminfo.mintick
+f_hhmm(int v) =>
+    int(math.floor(v / 100)) * 60 + v % 100
+int entryStartM = f_hhmm(entryStartHHMM)
+int entryEndM = f_hhmm(entryEndHHMM)
+int flattenM = f_hhmm(flattenHHMM)
+int barMin = hour(time, TZ) * 60 + minute(time, TZ)
+
+bool inRth = not na(time(timeframe.period, rthSess, TZ))
+bool inOn = not na(time(timeframe.period, onSess, TZ))
+bool rthStart = inRth and not inRth[1]
+bool onStart = inOn and not inOn[1]
+
+float vwap = ta.vwap(hlc3, rthStart)
+
+float hh3 = math.max(high, math.max(high[1], high[2]))
+float ll3 = math.min(low, math.min(low[1], low[2]))
+float cpos = (close - low) / math.max(high - low, tick)
+float disp6 = close[1] - close[7]
+bool initiative = math.max(math.abs(close - open), math.abs(close[1] - open[1])) >= retestImpulse * atr
+float lowestPrevClose = ta.lowest(close, 13)[2]
+float highestPrevClose = ta.highest(close, 13)[2]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LEVEL SOURCES (all causal: a level exists only once it is knowable)
+// ─────────────────────────────────────────────────────────────────────────────
+var float rthH = na
+var float rthL = na
+var float pdh = na
+var float pdl = na
+var float onRunH = na
+var float onRunL = na
+var float onh = na
+var float onl = na
+var float orRunH = na
+var float orRunL = na
+var float orh = na
+var float orl = na
+var int rthOpenTime = na
+
+if rthStart
+    if not na(rthH)
+        pdh := rthH
+        pdl := rthL
+    onh := onRunH
+    onl := onRunL
+    rthH := high
+    rthL := low
+    orRunH := high
+    orRunL := low
+    orh := na
+    orl := na
+    rthOpenTime := time
+else if inRth and not na(rthH)
+    rthH := math.max(rthH, high)
+    rthL := math.min(rthL, low)
+
+if onStart
+    onRunH := high
+    onRunL := low
+else if inOn
+    onRunH := na(onRunH) ? high : math.max(onRunH, high)
+    onRunL := na(onRunL) ? low : math.min(onRunL, low)
+
+bool inOR = inRth and not na(rthOpenTime) and time - rthOpenTime < orMins * 60000
+if inOR and not rthStart
+    orRunH := math.max(orRunH, high)
+    orRunL := math.min(orRunL, low)
+if inRth and not inOR and na(orh) and not na(orRunH)
+    orh := orRunH
+    orl := orRunL
+
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+float ph = ta.pivothigh(high, pivLeft, pivRight)
+float pl = ta.pivotlow(low, pivLeft, pivRight)
+var float[] pvH = array.new_float()
+var int[] pvHBar = array.new_int()
+var float[] pvL = array.new_float()
+var int[] pvLBar = array.new_int()
+const int PIVOT_LIFE = 234  // ≈ 3 RTH sessions of 5m bars
+if not na(ph)
+    array.push(pvH, ph)
+    array.push(pvHBar, bar_index - pivRight)
+if not na(pl)
+    array.push(pvL, pl)
+    array.push(pvLBar, bar_index - pivRight)
+while array.size(pvH) > 0 and (bar_index - array.get(pvHBar, 0) >= PIVOT_LIFE or array.size(pvH) > 4)
+    array.shift(pvH)
+    array.shift(pvHBar)
+while array.size(pvL) > 0 and (bar_index - array.get(pvLBar, 0) >= PIVOT_LIFE or array.size(pvL) > 4)
+    array.shift(pvL)
+    array.shift(pvLBar)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LEVEL MAP: collect → sort → merge confluent levels into one
+// ─────────────────────────────────────────────────────────────────────────────
+var float[] rawP = array.new_float()
+var string[] rawN = array.new_string()
+var bool[] rawE = array.new_bool()
+var float[] lvP = array.new_float()
+var string[] lvN = array.new_string()
+var bool[] lvE = array.new_bool()
+
+f_raw(float p, string n, bool ext) =>
+    if not na(p)
+        array.push(rawP, p)
+        array.push(rawN, n)
+        array.push(rawE, ext)
+
+array.clear(rawP)
+array.clear(rawN)
+array.clear(rawE)
+if usePD
+    f_raw(pdh, "PDH", true)
+    f_raw(pdl, "PDL", true)
+if useON
+    f_raw(onh, "ONH", true)
+    f_raw(onl, "ONL", true)
+if usePW
+    f_raw(pwh, "PWH", true)
+    f_raw(pwl, "PWL", true)
+if useOR
+    f_raw(orh, "ORH", false)
+    f_raw(orl, "ORL", false)
+if useSwings
+    for p in pvH
+        f_raw(p, "SWH", false)
+    for p in pvL
+        f_raw(p, "SWL", false)
+
+array.clear(lvP)
+array.clear(lvN)
+array.clear(lvE)
+if array.size(rawP) > 0 and not na(atr)
+    int[] ord = array.sort_indices(rawP, order.ascending)
+    for k = 0 to array.size(ord) - 1
+        int ix = array.get(ord, k)
+        float x = array.get(rawP, ix)
+        int m = array.size(lvP)
+        if m > 0 and x - array.get(lvP, m - 1) <= mergeAtr * atr
+            array.set(lvP, m - 1, (array.get(lvP, m - 1) + x) / 2.0)
+            array.set(lvN, m - 1, array.get(lvN, m - 1) + "+" + array.get(rawN, ix))
+            array.set(lvE, m - 1, array.get(lvE, m - 1) or array.get(rawE, ix))
+        else
+            array.push(lvP, x)
+            array.push(lvN, array.get(rawN, ix))
+            array.push(lvE, array.get(rawE, ix))
+
+f_key(float x) =>
+    int(math.round(x / syminfo.mintick))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DAILY STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var int tradesToday = 0
+var int lossesToday = 0
+var int[] usedKeys = array.new_int()      // level key * 10 + setup tag
+var int[] accKey = array.new_int()
+var int[] accDir = array.new_int()
+var int[] accBar = array.new_int()
+const int TAG_FADE_S = 1
+const int TAG_FADE_L = 2
+const int TAG_RET_L = 3
+const int TAG_RET_S = 4
+
+if rthStart
+    tradesToday := 0
+    lossesToday := 0
+    array.clear(usedKeys)
+    array.clear(accKey)
+    array.clear(accDir)
+    array.clear(accBar)
+
+f_used(int key, int tag) =>
+    array.includes(usedKeys, key * 10 + tag)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER / POSITION STATE
+// ─────────────────────────────────────────────────────────────────────────────
+var bool pendActive = false
+var int pendBar = na
+var int pendDir = 0
+var bool pendIsLimit = false
+var float pendTrig = na
+var float pendStop = na
+var float pendTp1 = na
+var float pendTp2 = na
+var float pendRisk = na
+var string pendSetup = ""
+var string pendLevel = ""
+var int closedAtSignal = 0
+
+var int tDir = 0
+var float tEntry = na
+var float tStop = na
+var float tTp1 = na
+var float tTp2 = na
+var float tRisk = na
+var bool tTp1Done = false
+var string tSetup = ""
+var string tLevel = ""
+var float netAtFlat = 0.0
+
+// Per-POSITION statistics (TradingView splits partial exits into separate rows).
+var int stN = 0
+var int stWins = 0
+var float stSumR = 0.0
+var float stWinR = 0.0
+var float stLossR = 0.0
+
+int qTp1 = math.max(1, math.min(contracts - 1, int(math.round(contracts * tp1Pct / 100.0))))
+int qRun = contracts - qTp1
+bool posOpen = strategy.position_size != 0
+
+f_entryId(int d) =>
+    d == 1 ? "L" : "S"
+
+// 1) Pending order: filled or expired?
+if pendActive
+    bool filled = posOpen or strategy.closedtrades > closedAtSignal
+    if filled
+        pendActive := false
+        tradesToday += 1
+        tDir := pendDir
+        tEntry := posOpen ? strategy.position_avg_price : pendTrig
+        tStop := pendStop
+        tTp1 := pendTp1
+        tTp2 := pendTp2
+        tRisk := pendRisk
+        tTp1Done := false
+        tSetup := pendSetup
+        tLevel := pendLevel
+    else if bar_index >= pendBar + armBars or barMin >= flattenM
+        strategy.cancel(f_entryId(pendDir))
+        pendActive := false
+
+// 2) TP1 filled → runner stop to breakeven(+)
+if posOpen and tDir != 0 and not tTp1Done and math.abs(strategy.position_size) < contracts
+    tTp1Done := true
+    tStop := tEntry + tDir * beR * tRisk
+    strategy.exit(tDir == 1 ? "L-RUN" : "S-RUN", f_entryId(tDir), qty=qRun, stop=tStop, limit=tTp2,
+         comment_loss="BE", comment_profit="TP2",
+         alert_message="AUCTION EDGE · RUNNER STOP → " + str.tostring(tStop, format.mintick))
+
+// 3) Hard flatten before the close
+if posOpen and barMin >= flattenM and inRth
+    strategy.close_all(comment="EOD", alert_message="AUCTION EDGE · FLATTEN EOD", immediately=true)
+
+// 4) Position finished → per-position bookkeeping
+if tDir != 0 and strategy.position_size == 0
+    float pnl = strategy.netprofit - netAtFlat
+    netAtFlat := strategy.netprofit
+    float r = pnl / math.max(tRisk * contracts * syminfo.pointvalue, 1e-9)
+    stN += 1
+    stSumR += r
+    if r > 0.02
+        stWins += 1
+        stWinR += r
+    else
+        stLossR -= r
+    if r <= -0.5
+        lossesToday += 1
+    tDir := 0
+
+posOpen := strategy.position_size != 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETUP DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
+bool inEntryWindow = inRth and barMin >= entryStartM and barMin <= entryEndM
+bool canSignal = not posOpen and not pendActive and tDir == 0 and inEntryWindow and tradesToday < maxTrades
+     and lossesToday < maxLosses and atr > 0 and bar_index > 20
+
+// candidates: setup (1 fade, 2 retest), dir, level, name, stop, stop-entry trigger, tag
+var int[] cSetup = array.new_int()
+var int[] cDir = array.new_int()
+var float[] cX = array.new_float()
+var string[] cName = array.new_string()
+var float[] cStop = array.new_float()
+var float[] cTrig = array.new_float()
+var int[] cTag = array.new_int()
+array.clear(cSetup)
+array.clear(cDir)
+array.clear(cX)
+array.clear(cName)
+array.clear(cStop)
+array.clear(cTrig)
+array.clear(cTag)
+
+f_cand(int setup, int d, float x, string nm, float stp, float trig, int tag) =>
+    array.push(cSetup, setup)
+    array.push(cDir, d)
+    array.push(cX, x)
+    array.push(cName, nm)
+    array.push(cStop, stp)
+    array.push(cTrig, trig)
+    array.push(cTag, tag)
+
+int nLv = array.size(lvP)
+if nLv > 0 and (canSignal or inRth) and not na(atr)
+    float ab = acceptAtr * atr
+    for k = 0 to nLv - 1
+        float x = array.get(lvP, k)
+        string nm = array.get(lvN, k)
+        int key = f_key(x)
+
+        // FADE — failed auction at external liquidity
+        if canSignal and useFade and (array.get(lvE, k) or not fadeExtOnly)
+            int accAbove = (close > x + ab ? 1 : 0) + (close[1] > x + ab ? 1 : 0) + (close[2] > x + ab ? 1 : 0)
+            int accBelow = (close < x - ab ? 1 : 0) + (close[1] < x - ab ? 1 : 0) + (close[2] < x - ab ? 1 : 0)
+            if close < x and hh3 > x + penAtr * atr and hh3 - x <= maxPenAtr * atr and close[3] < x and accAbove < 2
+                 and cpos <= closePosMax and not f_used(key, TAG_FADE_S)
+                 and not (impulseGuard and disp6 > impulseAtrMax * atr)
+                f_cand(1, -1, x, nm, hh3 + stopBufAtr * atr, low - tick, TAG_FADE_S)
+            if close > x and ll3 < x - penAtr * atr and x - ll3 <= maxPenAtr * atr and close[3] > x and accBelow < 2
+                 and cpos >= 1 - closePosMax and not f_used(key, TAG_FADE_L)
+                 and not (impulseGuard and -disp6 > impulseAtrMax * atr)
+                f_cand(1, 1, x, nm, ll3 - stopBufAtr * atr, high + tick, TAG_FADE_L)
+
+        // RETEST — initiative acceptance, then first hold of the level
+        if useRetest and inRth
+            int ai = array.indexof(accKey, key)
+            int curDir = ai >= 0 ? array.get(accDir, ai) : 0
+            if initiative and close > x + ab and close[1] > x + ab and lowestPrevClose < x and curDir != 1
+                if ai >= 0
+                    array.set(accDir, ai, 1)
+                    array.set(accBar, ai, bar_index)
+                else
+                    array.push(accKey, key)
+                    array.push(accDir, 1)
+                    array.push(accBar, bar_index)
+            else if initiative and close < x - ab and close[1] < x - ab and highestPrevClose > x and curDir != -1
+                if ai >= 0
+                    array.set(accDir, ai, -1)
+                    array.set(accBar, ai, bar_index)
+                else
+                    array.push(accKey, key)
+                    array.push(accDir, -1)
+                    array.push(accBar, bar_index)
+            ai := array.indexof(accKey, key)
+            if canSignal and ai >= 0
+                int age = bar_index - array.get(accBar, ai)
+                int sd = array.get(accDir, ai)
+                if age > 0 and age <= retestBars
+                    float t = touchAtr * atr
+                    if sd == 1 and low <= x + t and close > x and low >= x - 0.5 * atr and cpos >= 0.5 and not f_used(key, TAG_RET_L)
+                        f_cand(2, 1, x, nm, math.min(low, x) - stopBufAtr * atr, high + tick, TAG_RET_L)
+                    if sd == -1 and high >= x - t and close < x and high <= x + 0.5 * atr and cpos <= 0.5 and not f_used(key, TAG_RET_S)
+                        f_cand(2, -1, x, nm, math.max(high, x) + stopBufAtr * atr, low - tick, TAG_RET_S)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHOOSE + ARM (first candidate with valid risk and room)
+// ─────────────────────────────────────────────────────────────────────────────
+if canSignal and array.size(cSetup) > 0
+    for c = 0 to array.size(cSetup) - 1
+        int setup = array.get(cSetup, c)
+        int d = array.get(cDir, c)
+        float x = array.get(cX, c)
+        float stp = array.get(cStop, c)
+        float trig = array.get(cTrig, c)
+        bool isLimit = false
+        if setup == 1 and (x - close) * d < 0
+            // FADE: rest a limit back at the swept level
+            trig := x
+            isLimit := true
+        float risk = math.abs(trig - stp)
+        if risk >= minRiskAtr * atr and risk <= maxRiskAtr * atr
+            // room to the first opposing level (VWAP counts as a magnet for fades)
+            float room = na
+            float runDist = na
+            for j = 0 to nLv - 1
+                float dist = (array.get(lvP, j) - trig) * d
+                if dist > 0.1 * atr
+                    room := na(room) ? dist : math.min(room, dist)
+                    if dist >= runMinR * risk
+                        runDist := na(runDist) ? dist : math.min(runDist, dist)
+            if setup == 1 and not na(vwap)
+                float vd = (vwap - trig) * d
+                if vd > 0.1 * atr
+                    room := na(room) ? vd : math.min(room, vd)
+                    if vd >= runMinR * risk
+                        runDist := na(runDist) ? vd : math.min(runDist, vd)
+            if na(room) or room >= minRoomR * risk
+                float rr = na(runDist) ? runDefR : math.min(runMaxR, runDist / risk)
+                float tp1 = trig + d * tp1R * risk
+                float tp2 = trig + d * rr * risk
+                string eid = f_entryId(d)
+                string setupTxt = setup == 1 ? "FADE" : "RETEST"
+                string nm = array.get(cName, c)
+                string msg = "AUCTION EDGE · " + (d == 1 ? "BUY " : "SELL ") + (isLimit ? "LIMIT " : "STOP ") + str.tostring(trig, format.mintick)
+                     + " · STOP " + str.tostring(stp, format.mintick) + " · TP1 " + str.tostring(tp1, format.mintick)
+                     + " · TP2 " + str.tostring(tp2, format.mintick) + " · " + setupTxt + " @" + nm
+                if isLimit
+                    strategy.entry(eid, d == 1 ? strategy.long : strategy.short, qty=contracts, limit=trig, comment=setupTxt + " " + nm, alert_message=msg)
+                else
+                    strategy.entry(eid, d == 1 ? strategy.long : strategy.short, qty=contracts, stop=trig, comment=setupTxt + " " + nm, alert_message=msg)
+                strategy.exit(eid + "-TP1", eid, qty=qTp1, stop=stp, limit=tp1, comment_loss="STOP", comment_profit="TP1",
+                     alert_message="AUCTION EDGE · EXIT " + (d == 1 ? "LONG" : "SHORT") + " PART (TP1/STOP)")
+                strategy.exit(eid + "-RUN", eid, qty=qRun, stop=stp, limit=tp2, comment_loss="STOP", comment_profit="TP2",
+                     alert_message="AUCTION EDGE · EXIT " + (d == 1 ? "LONG" : "SHORT") + " RUNNER (TP2/STOP)")
+                pendActive := true
+                pendBar := bar_index
+                pendDir := d
+                pendIsLimit := isLimit
+                pendTrig := trig
+                pendStop := stp
+                pendTp1 := tp1
+                pendTp2 := tp2
+                pendRisk := risk
+                pendSetup := setupTxt
+                pendLevel := nm
+                closedAtSignal := strategy.closedtrades
+                array.push(usedKeys, f_key(x) * 10 + array.get(cTag, c))
+                if showSignals
+                    label.new(bar_index, d == 1 ? low : high, setupTxt + (d == 1 ? " ▲ " : " ▼ ") + nm,
+                         style=d == 1 ? label.style_label_up : label.style_label_down,
+                         color=d == 1 ? color.new(#26a69a, 15) : color.new(#ef5350, 15), textcolor=color.white, size=size.small)
+                break
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────────────────────
+bool tradeLive = tDir != 0 and strategy.position_size != 0
+plot(showTrade and tradeLive ? tEntry : na, "Entry", color.new(color.gray, 0), 1, plot.style_linebr)
+plot(showTrade and tradeLive ? tStop : na, "Stop", color.new(#ef5350, 0), 2, plot.style_linebr)
+plot(showTrade and tradeLive and not tTp1Done ? tTp1 : na, "TP1", color.new(#26a69a, 30), 1, plot.style_linebr)
+plot(showTrade and tradeLive ? tTp2 : na, "TP2", color.new(#26a69a, 0), 2, plot.style_linebr)
+plot(showTrade and pendActive ? pendTrig : na, "Pending entry", color.new(color.orange, 0), 2, plot.style_circles)
+plot(inRth ? vwap : na, "RTH VWAP", color.new(color.purple, 55), 1, plot.style_linebr)
+
+var line[] lvLines = array.new_line()
+var label[] lvLabels = array.new_label()
+if barstate.islast
+    for ln in lvLines
+        line.delete(ln)
+    for lb in lvLabels
+        label.delete(lb)
+    array.clear(lvLines)
+    array.clear(lvLabels)
+    if showLevels and nLv > 0
+        for k = 0 to nLv - 1
+            float x = array.get(lvP, k)
+            if math.abs(x - close) <= levelRadiusAtr * atr
+                bool ext = array.get(lvE, k)
+                color col = ext ? color.new(#f5a623, 10) : color.new(#8a8f98, 35)
+                array.push(lvLines, line.new(bar_index - 40, x, bar_index + 8, x, color=col, width=ext ? 2 : 1, style=ext ? line.style_solid : line.style_dashed))
+                array.push(lvLabels, label.new(bar_index + 8, x, array.get(lvN, k), style=label.style_label_left, color=color.new(color.black, 100), textcolor=col, size=size.small))
+
+var table panel = table.new(position.top_right, 2, 8, bgcolor=color.new(#131722, 10), border_width=1, border_color=color.new(#2a2e39, 0))
+f_cell(int row, string a, string b, color cb) =>
+    table.cell(panel, 0, row, a, text_color=color.new(#b2b5be, 0), text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, row, b, text_color=cb, text_size=size.small, text_halign=text.align_right)
+
+if showPanel and barstate.islast
+    color up = #26a69a
+    color dn = #ef5350
+    string state = tradeLive ? (tDir == 1 ? "IN LONG" : "IN SHORT") + " · " + tSetup + " @" + tLevel :
+         pendActive ? "ARMED " + (pendDir == 1 ? "LONG" : "SHORT") + " · " + pendSetup + " @" + pendLevel :
+         not inEntryWindow ? "OUTSIDE WINDOW" :
+         lossesToday >= maxLosses or tradesToday >= maxTrades ? "DONE FOR DAY" : "SCANNING"
+    color stateCol = tradeLive or pendActive ? ((tradeLive ? tDir : pendDir) == 1 ? up : dn) : color.white
+    table.cell(panel, 0, 0, "AUCTION EDGE v1.0", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, 0, syminfo.ticker, text_color=color.new(#b2b5be, 0), text_size=size.small, text_halign=text.align_right)
+    f_cell(1, "State", state, stateCol)
+    float showEntry = tradeLive ? tEntry : pendActive ? pendTrig : na
+    f_cell(2, "Entry", na(showEntry) ? "—" : str.tostring(showEntry, format.mintick), color.white)
+    f_cell(3, "Stop", tradeLive ? str.tostring(tStop, format.mintick) + (tTp1Done ? " (BE)" : "") : pendActive ? str.tostring(pendStop, format.mintick) : "—", dn)
+    f_cell(4, "TP1 / TP2", tradeLive ? str.tostring(tTp1, format.mintick) + " / " + str.tostring(tTp2, format.mintick) :
+         pendActive ? str.tostring(pendTp1, format.mintick) + " / " + str.tostring(pendTp2, format.mintick) : "—", up)
+    f_cell(5, "Today", str.tostring(tradesToday) + "/" + str.tostring(maxTrades) + " trades · " + str.tostring(lossesToday) + "/" + str.tostring(maxLosses) + " losses", color.white)
+    string wr = stN > 0 ? str.tostring(100.0 * stWins / stN, "#.#") + "%" : "—"
+    string pf = stLossR > 0 ? str.tostring(stWinR / stLossR, "#.##") : "—"
+    f_cell(6, "Positions · win%", str.tostring(stN) + " · " + wr, color.white)
+    float avgR = stN > 0 ? stSumR / stN : 0.0
+    f_cell(7, "Avg R · PF", stN > 0 ? (avgR >= 0 ? "+" : "") + str.tostring(avgR, "#.##") + "R · " + pf : "—", stSumR >= 0 ? up : dn)

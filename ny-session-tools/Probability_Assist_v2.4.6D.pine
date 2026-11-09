@@ -1,0 +1,2479 @@
+//@version=6
+strategy(
+    "Probability Assist v2.4.6D - London Low-Volume Pullback Gate",
+    overlay=true,
+    max_labels_count=500,
+    max_lines_count=100,
+    max_boxes_count=50,
+    pyramiding=0,
+    process_orders_on_close=true,
+    initial_capital=100000,
+    currency=currency.USD,
+    default_qty_type=strategy.fixed,
+    default_qty_value=1
+)
+
+// =============================================================================
+// PROBABILITY ASSIST v2 - RESEARCH BUILD
+// One engine: LONG / SHORT / WAIT.
+// Designed for a 5-minute MNQ chart with confirmed 15-minute context.
+//
+// v2.4.6D London low-volume Pullback surgery:
+// - Reject Pullback family entries only during London when the time-adjusted
+//   RVOL z-score is below -0.5.
+// - RTH low-volume Pullbacks remain enabled.
+// - Sweeps are completely exempt from this volume rule.
+// - No probability, target, stop, WAIT, health, AMD/intermarket, scanner,
+//   or alert calculations are otherwise changed.
+//
+// v2.4.6B short-breakout surgery:
+// - SHORT family-2 BREAKOUT candidates are rejected at the final hard-candidate gate.
+// - LONG breakouts remain enabled.
+// - Family precedence is preserved; blocked SHORT breakouts do not become pullbacks.
+// - No probability, target, stop, WAIT, health, AMD/intermarket, scanner, or alert
+//   calculations are otherwise changed.
+//
+// v2.4.6A target-quality surgery:
+// - Actual entries require a non-London structural TP1; generic ATR/R fallback TP1 is rejected.
+// - WAIT setups may remain pending only when geometry can improve, and the actual fill is revalidated.
+// - No probability, setup-family, stop, health, AMD/intermarket, calibration, scanner, or alert logic is otherwise changed.
+//
+// v2.4.5 evidence-backed quality gates:
+// - Entry session filter defaults ON at 03:00-16:00 New York time; weak Asia entries are excluded.
+// - Breakout Family 2 is split into exceptional momentum breaks or confirmed retest/hold entries.
+// - Normal first-break entries no longer qualify without a retest unless momentum/participation is exceptional.
+// - Failed Break Family 4 is quarantined: it requires a later retest/hold, strong directional flow and a post-failure structure shift.
+// - Failed Break candidates require at least 4/5 evidence pillars regardless of the global 3/5 default.
+// - The micro scanner mirrors the same session, breakout and failed-break quality gates.
+// - Existing performance diagnostics remain active so the effect can be measured by family, direction and session.
+//
+// v2.4.4 diagnostics upgrade:
+// - Visible performance diagnostics by setup family, direction and entry session.
+// - Each family shows ALL / LONG / SHORT resolved win rates and sample counts.
+// - Session win rate is tracked by the actual entry session: Asia, London, RTH, or Other.
+// - Statistics use the same resolved-trade rule as the main record: TP1/TP2 = win; risk/invalidation = loss.
+// - Early exits and timeouts remain censored/unresolved and do not enter diagnostic win rates.
+// - Diagnostic bookkeeping is display-only and does not alter setup qualification, probability, entries, exits or alerts.
+//
+// v2.4.3 continuation-quality fixes:
+// - Family 1 Pullback can no longer use HTF or stale structure as sufficient trend context by itself.
+// - Pullbacks require a locally established EMA trend: correct stack, slope and minimum separation.
+// - A real directional leg must exist before the retracement (minimum prior excursion from EMA21).
+// - Fresh opposing local structure vetoes continuation pullbacks until structure flips back.
+// - Pullback rejection requires meaningful directional participation/flow by default.
+// - v2.4.2 true zone-touch/reclaim and opposite-impulse cooldown protections remain active.
+// - Micro scanner mirrors the established-trend pullback rules.
+// - Hidden family-level W/L diagnostics were added so future weak families are easier to isolate.
+//
+// Main v2 changes:
+// - Five independent evidence pillars; trigger is mandatory, 3/5 default.
+// - 15m is a modifier/veto only when strongly opposite, not a universal gate.
+// - Time-of-day RVOL is preferred over generic RVOL once enough history exists.
+// - ATR percentile regime changes entry behavior and probability threshold.
+// - OR5 / OR15 / OR30 acceptance, sweep and failed-break behavior.
+// - Faster setup coverage without re-introducing a separate scalp engine.
+// - TP1 is nearest credible objective with R and ATR sanity checks.
+// - TP2 is the next credible objective or bounded ATR fallback.
+// - No TP2 requirement is allowed to block a valid TP1 trade.
+// - Trade Health uses five independent post-entry components.
+// - EXIT NOW requires multiple failure flags, not one indicator flip.
+// - Displayed probability is an empirical-Bayes blend by setup family/regime.
+// - Entry Quality Gate separates correct direction from bad chase/exhaustion entries.
+// - Strong signals can WAIT PULLBACK when recent impulse, nearby obstacles, or exhaustion make the current price unattractive.
+// - First 1-2 bars after entry have a multi-factor immediate-failure EXIT check.
+// - AMD + MES/M2K intermarket context is bounded trade evidence: it can confirm reversal families and adjust directional probability.
+// - Cross-market evidence cannot create a standalone setup; the original four setup families remain mandatory.
+// - Alerts remain intentionally compact and unchanged.
+// - WAIT PULLBACK fills revalidate current evidence/probability and never display a stale setup probability.
+// - SMT comparison uses a confirmed-bar synchronization window instead of requiring same-bar sweeps.
+// - Broad aligned sweeps stay neutral until MNQ confirms distribution away from the sweep.
+// - Micro-only scanner: MNQ / MES / M2K / MYM / MGC / MCL.
+// - Scanner runs lightweight versions of the same four setup families on every market.
+// - WATCHING / PROMISING / TRADE READY states are ranked by normalized setup quality.
+// - External TRADE READY alerts only fire when another micro is materially better than MNQ.
+// - MGC/MCL are independent opportunity scans; they never confirm or veto MNQ.
+//
+// NOTE: lower-TF buy/sell volume is an intrabar-direction estimate, not native
+// CME aggressor-side order-book data. A separate footprint edition can use
+// TradingView request.footprint() on Premium/Ultimate plans.
+// =============================================================================
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+groupCore = "Core"
+confirmOnClose = input.bool(true, "Confirm Entries On Bar Close", group=groupCore)
+baseMinProbability = input.float(72.0, "Base Minimum Probability", minval=60.0, maxval=90.0, step=1.0, group=groupCore)
+minProbabilityEdge = input.float(4.0, "Minimum Long/Short Probability Edge", minval=0.0, maxval=20.0, step=1.0, group=groupCore)
+minPillars = input.int(3, "Minimum Independent Evidence Pillars", minval=3, maxval=5, group=groupCore)
+useSessionFilter = input.bool(true, "Restrict Entries To Trading Session", group=groupCore)
+tradeSession = input.session("0300-1600", "Trading Session", group=groupCore)
+maxTradeBars = input.int(72, "Maximum Active Trade Bars", minval=10, maxval=250, group=groupCore)
+
+groupTrend = "Trend / Structure"
+emaFastLength = input.int(9, "Fast EMA", minval=2, group=groupTrend)
+emaMidLength = input.int(21, "Mid EMA", minval=3, group=groupTrend)
+emaSlowLength = input.int(50, "Slow EMA", minval=5, group=groupTrend)
+swingLength = input.int(4, "Swing Length", minval=2, maxval=10, group=groupTrend)
+structureFreshBars = input.int(45, "Structure Freshness Bars", minval=10, maxval=200, group=groupTrend)
+htfTimeframe = input.timeframe("15", "Higher-Timeframe Context", group=groupTrend)
+adxLength = input.int(14, "ADX Length", minval=5, group=groupTrend)
+adxSmoothing = input.int(14, "ADX Smoothing", minval=5, group=groupTrend)
+strongADX = input.float(24.0, "Strong Trend ADX", minval=10.0, step=1.0, group=groupTrend)
+htfStrongDistanceATR = input.float(0.12, "Strong HTF EMA Separation / HTF ATR", minval=0.03, maxval=0.50, step=0.01, group=groupTrend)
+
+groupFlow = "Participation / Order Flow"
+volumeLength = input.int(20, "Fallback RVOL Length", minval=5, group=groupFlow)
+useTimeOfDayRVOL = input.bool(true, "Use Time-of-Day RVOL", group=groupFlow)
+todMinSamples = input.int(5, "Minimum Prior Same-Time Samples", minval=2, maxval=30, group=groupFlow)
+participationRVOL = input.float(1.10, "Useful Time-Adjusted RVOL", minval=0.70, maxval=3.0, step=0.05, group=groupFlow)
+strongRVOL = input.float(1.30, "Strong Time-Adjusted RVOL", minval=0.90, maxval=4.0, step=0.05, group=groupFlow)
+useDelta = input.bool(true, "Use Lower-TF Estimated Volume Delta", group=groupFlow)
+deltaTimeframe = input.timeframe("1", "Delta Lower Timeframe", group=groupFlow)
+deltaStrongPct = input.float(18.0, "Strong Delta %", minval=5.0, maxval=70.0, step=1.0, group=groupFlow)
+deltaExtremePct = input.float(35.0, "Extreme Delta %", minval=10.0, maxval=90.0, step=1.0, group=groupFlow)
+deltaPersistenceLength = input.int(3, "Delta Persistence Length", minval=2, maxval=10, group=groupFlow)
+
+groupRegime = "Volatility / Regime"
+atrLength = input.int(14, "ATR Length", minval=5, group=groupRegime)
+atrRankLookback = input.int(120, "ATR Percentile Lookback", minval=40, maxval=500, group=groupRegime)
+compressionRank = input.float(25.0, "Compression Below ATR Percentile", minval=5.0, maxval=45.0, step=1.0, group=groupRegime)
+activeRank = input.float(70.0, "Active Above ATR Percentile", minval=50.0, maxval=90.0, step=1.0, group=groupRegime)
+extremeRank = input.float(90.0, "Extreme Above ATR Percentile", minval=70.0, maxval=99.0, step=1.0, group=groupRegime)
+openThresholdDiscount = input.float(3.0, "NY Open Probability Discount", minval=0.0, maxval=8.0, step=0.5, group=groupRegime)
+activeThresholdDiscount = input.float(1.0, "Active-Regime Probability Discount", minval=0.0, maxval=5.0, step=0.5, group=groupRegime)
+compressionThresholdPremium = input.float(4.0, "Compression Probability Premium", minval=0.0, maxval=10.0, step=0.5, group=groupRegime)
+
+groupMomentum = "Momentum"
+rsiLength = input.int(14, "RSI Length", minval=5, group=groupMomentum)
+displacementATR = input.float(0.60, "Minimum Displacement Range ATR", minval=0.20, maxval=2.0, step=0.05, group=groupMomentum)
+bodyFraction = input.float(0.58, "Minimum Displacement Body Fraction", minval=0.40, maxval=0.90, step=0.01, group=groupMomentum)
+
+groupLiquidity = "Liquidity / Order Blocks"
+liquidityLookback = input.int(18, "Local Liquidity Lookback", minval=5, group=groupLiquidity)
+sweepToleranceATR = input.float(0.06, "Local Sweep Tolerance ATR", minval=0.0, maxval=0.5, step=0.01, group=groupLiquidity)
+obSearchBars = input.int(7, "OB Source Candle Search", minval=2, maxval=20, group=groupLiquidity)
+obMaxAge = input.int(90, "OB Maximum Age Bars", minval=20, maxval=500, group=groupLiquidity)
+obInvalidationATR = input.float(0.05, "OB Invalidation Buffer ATR", minval=0.0, maxval=0.25, step=0.01, group=groupLiquidity)
+opposingOBDistanceATR = input.float(0.45, "Opposing OB Penalty Distance ATR", minval=0.10, maxval=2.0, step=0.05, group=groupLiquidity)
+
+groupSessions = "Sessions / Opening Range"
+sessionTimezone = input.string("America/New_York", "Session Timezone", group=groupSessions)
+asiaSession = input.session("1800-0300", "Asia Session", group=groupSessions)
+londonSession = input.session("0300-0930", "London Session", group=groupSessions)
+overnightSession = input.session("1800-0930", "Overnight / Globex", group=groupSessions)
+or5Session = input.session("0930-0935", "NY OR5", group=groupSessions)
+or15Session = input.session("0930-0945", "NY OR15", group=groupSessions)
+or30Session = input.session("0930-1000", "NY OR30", group=groupSessions)
+nyOpenWindow = input.session("0930-1030", "NY Opening Regime Window", group=groupSessions)
+rthStatsSession = input.session("0930-1600", "RTH Performance Session (Stats Only)", group=groupSessions)
+sessionSweepToleranceATR = input.float(0.05, "Session Sweep Tolerance ATR", minval=0.0, maxval=0.5, step=0.01, group=groupSessions)
+acceptanceBufferATR = input.float(0.04, "Acceptance Buffer ATR", minval=0.0, maxval=0.30, step=0.01, group=groupSessions)
+failedBreakWindow = input.int(4, "Failed Break Detection Window Bars", minval=1, maxval=10, group=groupSessions)
+
+groupEntry = "Entry / Risk / Targets"
+useTargetQualityGate = input.bool(true, "v2.4.6A: Reject ATR/R Fallback + London TP1", group=groupEntry)
+useShortBreakoutGate = input.bool(true, "v2.4.6B: Reject SHORT Breakout Family", group=groupEntry)
+useLondonLowVolPullbackGate = input.bool(true, "v2.4.6D: Reject London Pullback When Vol Z < -0.5", group=groupEntry)
+usePullbackEngine = input.bool(true, "Wait For Pullback When Extended", group=groupEntry)
+waitDistanceATR = input.float(0.80, "Wait If Extended From Anchor ATR", minval=0.20, maxval=2.0, step=0.05, group=groupEntry)
+useEntryQualityGate = input.bool(true, "Use Entry Quality Gate", group=groupEntry)
+recentRunLookback = input.int(6, "Recent Impulse Lookback Bars", minval=3, maxval=15, group=groupEntry)
+maxRecentRunATR = input.float(1.35, "Chase Threshold - Recent Run ATR", minval=0.50, maxval=4.0, step=0.05, group=groupEntry)
+minCleanRoomATR = input.float(0.55, "Minimum Clean Room To First Obstacle ATR", minval=0.15, maxval=2.0, step=0.05, group=groupEntry)
+exhaustionWickFraction = input.float(0.32, "Exhaustion Wick Fraction", minval=0.15, maxval=0.70, step=0.01, group=groupEntry)
+exhaustionRSI = input.float(66.0, "Exhaustion RSI Level", minval=55.0, maxval=85.0, step=1.0, group=groupEntry)
+pullbackZoneHalfATR = input.float(0.15, "Pullback Zone Half-Width ATR", minval=0.03, maxval=0.5, step=0.01, group=groupEntry)
+pullbackExpiryBars = input.int(12, "Pullback Setup Expiry Bars", minval=3, maxval=60, group=groupEntry)
+oppositeImpulseCooldownBars = input.int(2, "Opposite Impulse Cooldown Bars", minval=1, maxval=5, group=groupEntry)
+pullbackTrendLookback = input.int(6, "Pullback Prior Trend-Leg Lookback Bars", minval=3, maxval=15, group=groupEntry)
+pullbackSlopeBars = input.int(2, "Pullback EMA21 Slope Lookback Bars", minval=1, maxval=6, group=groupEntry)
+pullbackMinExcursionATR = input.float(0.45, "Pullback Minimum Prior Trend Excursion ATR", minval=0.15, maxval=1.50, step=0.05, group=groupEntry)
+pullbackMinEMASeparationATR = input.float(0.08, "Pullback Minimum EMA21/50 Separation ATR", minval=0.0, maxval=0.50, step=0.01, group=groupEntry)
+requirePullbackFlowConfirmation = input.bool(true, "Require Directional Flow For Pullbacks", group=groupEntry)
+momentumBypassProbability = input.float(78.0, "Momentum Entry Minimum Model Probability", minval=65.0, maxval=95.0, step=1.0, group=groupEntry)
+momentumBypassRVOL = input.float(1.25, "Momentum Entry Minimum Time-Adjusted RVOL", minval=0.8, maxval=4.0, step=0.05, group=groupEntry)
+riskStopATR = input.float(0.80, "Risk Stop ATR", minval=0.25, maxval=3.0, step=0.05, group=groupEntry)
+minRiskDistanceATR = input.float(0.25, "Minimum Risk Stop Distance ATR", minval=0.05, maxval=1.0, step=0.05, group=groupEntry)
+invalidationBufferATR = input.float(0.08, "Invalidation Buffer ATR", minval=0.0, maxval=0.5, step=0.01, group=groupEntry)
+minimumTP1RR = input.float(0.80, "Minimum TP1 R:R", minval=0.3, maxval=2.0, step=0.1, group=groupEntry)
+maximumTP1RR = input.float(2.50, "Maximum Preferred TP1 R:R", minval=1.0, maxval=8.0, step=0.25, group=groupEntry)
+tp1FallbackATR = input.float(1.10, "TP1 ATR Fallback", minval=0.4, maxval=3.0, step=0.05, group=groupEntry)
+tp2FallbackATR = input.float(1.90, "TP2 ATR Fallback", minval=0.8, maxval=6.0, step=0.10, group=groupEntry)
+tp2MinGapATR = input.float(0.35, "Minimum TP2 Gap Beyond TP1 ATR", minval=0.10, maxval=2.0, step=0.05, group=groupEntry)
+tp1MaxATRCompression = input.float(1.30, "TP1 Max ATR - Compression", minval=0.5, maxval=4.0, step=0.1, group=groupEntry)
+tp1MaxATRNormal = input.float(1.80, "TP1 Max ATR - Normal", minval=0.8, maxval=5.0, step=0.1, group=groupEntry)
+tp1MaxATRActive = input.float(2.20, "TP1 Max ATR - Active", minval=1.0, maxval=6.0, step=0.1, group=groupEntry)
+tp1MaxATRExtreme = input.float(2.80, "TP1 Max ATR - Extreme", minval=1.0, maxval=8.0, step=0.1, group=groupEntry)
+tp2MaxATRCompression = input.float(2.20, "TP2 Max ATR - Compression", minval=1.0, maxval=6.0, step=0.1, group=groupEntry)
+tp2MaxATRNormal = input.float(3.00, "TP2 Max ATR - Normal", minval=1.5, maxval=8.0, step=0.1, group=groupEntry)
+tp2MaxATRActive = input.float(3.60, "TP2 Max ATR - Active", minval=1.5, maxval=10.0, step=0.1, group=groupEntry)
+tp2MaxATRExtreme = input.float(4.50, "TP2 Max ATR - Extreme", minval=2.0, maxval=12.0, step=0.1, group=groupEntry)
+
+groupHealth = "Trade Health / Early Exit"
+useTradeHealth = input.bool(true, "Enable Early Exit Logic", group=groupHealth)
+healthWarningLevel = input.float(60.0, "Weakening Health", minval=30.0, maxval=90.0, step=1.0, group=groupHealth)
+earlyExitConfirmBars = input.int(2, "3-Failure EXIT Confirmation Bars", minval=1, maxval=5, group=groupHealth)
+progressLookbackBars = input.int(5, "Failure-To-Progress Lookback", minval=2, maxval=15, group=groupHealth)
+immediateFailureBars = input.int(2, "Immediate Failure Window Bars", minval=1, maxval=4, group=groupHealth)
+immediateFailureRiskFraction = input.float(0.35, "Immediate Failure Adverse Risk Fraction", minval=0.15, maxval=0.70, step=0.05, group=groupHealth)
+
+groupProbability = "Probability Calibration"
+probabilityPriorStrength = input.float(24.0, "Historical Bucket Prior Strength", minval=5.0, maxval=100.0, step=1.0, group=groupProbability)
+initialGlobalPrior = input.float(68.0, "Initial TP1 Prior %", minval=50.0, maxval=85.0, step=1.0, group=groupProbability)
+showCalibrationSamples = input.bool(false, "Show Calibration Sample Count In Data Window", group=groupProbability)
+
+groupIntermarket = "AMD / Intermarket Analysis"
+showAMDIntermarket = input.bool(true, "Show AMD + MES/M2K Context In Panel", group=groupIntermarket)
+useAMDIntermarketAnalysis = input.bool(true, "Use AMD + Intermarket In Trade Analysis", group=groupIntermarket)
+esSymbol = input.symbol("CME_MINI:MES1!", "MES Comparison Symbol", group=groupIntermarket)
+rtySymbol = input.symbol("CME_MINI:M2K1!", "M2K Comparison Symbol", group=groupIntermarket)
+amdRangeLookback = input.int(12, "AMD Accumulation Lookback Bars", minval=6, maxval=40, group=groupIntermarket)
+amdMaxRangeATR = input.float(2.20, "AMD Max Accumulation Range ATR", minval=0.80, maxval=5.0, step=0.10, group=groupIntermarket)
+amdMaxADX = input.float(23.0, "AMD Max Accumulation ADX", minval=10.0, maxval=35.0, step=1.0, group=groupIntermarket)
+amdSweepBufferATR = input.float(0.05, "AMD Manipulation Sweep Buffer ATR", minval=0.0, maxval=0.30, step=0.01, group=groupIntermarket)
+amdDistributionWindow = input.int(6, "AMD Distribution Confirmation Window", minval=2, maxval=15, group=groupIntermarket)
+amdProbabilityWeight = input.float(2.5, "AMD Distribution Probability Weight", minval=0.0, maxval=6.0, step=0.5, group=groupIntermarket)
+smtProbabilityWeight = input.float(1.5, "SMT Probability Weight Per Market", minval=0.0, maxval=4.0, step=0.5, group=groupIntermarket)
+smtSyncWindowBars = input.int(2, "SMT Sweep Sync Window Bars", minval=1, maxval=6, group=groupIntermarket)
+alignmentProbabilityWeight = input.float(1.0, "MES/M2K Alignment Probability Weight", minval=0.0, maxval=3.0, step=0.5, group=groupIntermarket)
+maxIntermarketProbabilityAdjustment = input.float(5.0, "Maximum Intermarket Probability Adjustment", minval=1.0, maxval=10.0, step=0.5, group=groupIntermarket)
+
+
+groupScanner = "Micro Market Scanner"
+showMicroScanner = input.bool(true, "Show Micro Scanner In Panel", group=groupScanner)
+useMicroScannerAlerts = input.bool(true, "Alert When A Better External Micro Is Trade Ready", group=groupScanner)
+scannerPromisingQuality = input.float(70.0, "Promising Quality", minval=60.0, maxval=90.0, step=1.0, group=groupScanner)
+scannerReadyQuality = input.float(78.0, "Trade Ready Quality", minval=65.0, maxval=95.0, step=1.0, group=groupScanner)
+scannerBetterEdge = input.float(4.0, "External Alert Minimum Quality Edge vs MNQ", minval=0.0, maxval=15.0, step=1.0, group=groupScanner)
+mnqScanSymbol = input.symbol("CME_MINI:MNQ1!", "MNQ Scanner Symbol", group=groupScanner)
+mesScanSymbol = input.symbol("CME_MINI:MES1!", "MES Scanner Symbol", group=groupScanner)
+m2kScanSymbol = input.symbol("CME_MINI:M2K1!", "M2K Scanner Symbol", group=groupScanner)
+mymScanSymbol = input.symbol("CBOT_MINI:MYM1!", "MYM Scanner Symbol", group=groupScanner)
+mgcScanSymbol = input.symbol("COMEX_MINI:MGC1!", "MGC Scanner Symbol", group=groupScanner)
+mclScanSymbol = input.symbol("NYMEX:MCL1!", "MCL Scanner Symbol", group=groupScanner)
+
+groupDisplay = "Display"
+showTable = input.bool(true, "Show Compact Trade Table", group=groupDisplay)
+showEntryLabels = input.bool(true, "Show LONG / SHORT Entry Labels", group=groupDisplay)
+showPriceLabels = input.bool(true, "Label Active Entry / Stops / Targets", group=groupDisplay)
+showContextLines = input.bool(false, "Show EMA / VWAP", group=groupDisplay)
+showSessionLevels = input.bool(false, "Show Session / OR Levels", group=groupDisplay)
+showOrderBlocks = input.bool(false, "Show Latest Order Blocks", group=groupDisplay)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_clamp(float value, float lo, float hi) =>
+    math.max(lo, math.min(hi, value))
+
+
+// Lightweight, symbol-local scanner engine. It mirrors the four setup families
+// using ATR/volume-normalized rules so the same logic can compare index, metal
+// and energy micros without reusing raw MNQ point distances. This is a setup
+// QUALITY score, not the empirically calibrated TP1 probability of the main bot.
+f_scan_market() =>
+    float sATR = ta.atr(atrLength)
+    float sEMA9 = ta.ema(close, emaFastLength)
+    float sEMA21 = ta.ema(close, emaMidLength)
+    float sEMA50 = ta.ema(close, emaSlowLength)
+    float sVWAP = ta.vwap(hlc3)
+    float sRSI = ta.rsi(close, rsiLength)
+    [sPlusDI, sMinusDI, sADX] = ta.dmi(adxLength, adxSmoothing)
+    float sVolumeAverage = ta.sma(volume, volumeLength)
+    float sRVOL = not na(sVolumeAverage) and sVolumeAverage > 0 ? volume / sVolumeAverage : 1.0
+    float sRange = math.max(high - low, 0.0000001)
+    float sBody = math.abs(close - open)
+    bool sBullDisplacement = close > open and sBody >= sRange * bodyFraction and sRange >= sATR * displacementATR and close >= high[1]
+    bool sBearDisplacement = close < open and sBody >= sRange * bodyFraction and sRange >= sATR * displacementATR and close <= low[1]
+    int sBullCloses3 = (close > open ? 1 : 0) + (close[1] > open[1] ? 1 : 0) + (close[2] > open[2] ? 1 : 0)
+    int sBearCloses3 = (close < open ? 1 : 0) + (close[1] < open[1] ? 1 : 0) + (close[2] < open[2] ? 1 : 0)
+    bool sBullPersistence = close > close[2] and sBullCloses3 >= 2
+    bool sBearPersistence = close < close[2] and sBearCloses3 >= 2
+    float sSafeATR = math.max(sATR, 0.0000001)
+    float sBullPriorExcursionATR = ta.highest((high[1] - sEMA21[1]) / math.max(sATR[1], 0.0000001), pullbackTrendLookback)
+    float sBearPriorExcursionATR = ta.highest((sEMA21[1] - low[1]) / math.max(sATR[1], 0.0000001), pullbackTrendLookback)
+    bool sBullTrend = sEMA9 > sEMA21 and sEMA21 > sEMA50 and sEMA21 > sEMA21[pullbackSlopeBars] and (sEMA21 - sEMA50) / sSafeATR >= pullbackMinEMASeparationATR and sBullPriorExcursionATR >= pullbackMinExcursionATR
+    bool sBearTrend = sEMA9 < sEMA21 and sEMA21 < sEMA50 and sEMA21 < sEMA21[pullbackSlopeBars] and (sEMA50 - sEMA21) / sSafeATR >= pullbackMinEMASeparationATR and sBearPriorExcursionATR >= pullbackMinExcursionATR
+    bool sSevereChop = sADX <= 16.0 and math.abs(sEMA21 - sEMA50) <= sATR * 0.16
+
+    float sPriorHigh = ta.highest(high[1], liquidityLookback)
+    float sPriorLow = ta.lowest(low[1], liquidityLookback)
+    bool sLowSweep = not na(sPriorLow) and low < sPriorLow - sATR * sweepToleranceATR and close > sPriorLow
+    bool sHighSweep = not na(sPriorHigh) and high > sPriorHigh + sATR * sweepToleranceATR and close < sPriorHigh
+    bool sBullBreak = not na(sPriorHigh) and close > sPriorHigh + sATR * acceptanceBufferATR and (sBullDisplacement or sBullPersistence) and sRVOL >= participationRVOL
+    bool sBearBreak = not na(sPriorLow) and close < sPriorLow - sATR * acceptanceBufferATR and (sBearDisplacement or sBearPersistence) and sRVOL >= participationRVOL
+
+    float sLastBullBreakLevel = ta.valuewhen(sBullBreak, sPriorHigh, 0)
+    float sLastBearBreakLevel = ta.valuewhen(sBearBreak, sPriorLow, 0)
+    int sBarsSinceBullBreak = ta.barssince(sBullBreak)
+    int sBarsSinceBearBreak = ta.barssince(sBearBreak)
+    bool sFailedBullBreak = not na(sLastBullBreakLevel) and not na(sBarsSinceBullBreak) and sBarsSinceBullBreak >= 1 and sBarsSinceBullBreak <= failedBreakWindow and close < sLastBullBreakLevel - sATR * acceptanceBufferATR * 0.5 and (sBearDisplacement or (close < open and close < sEMA21))
+    bool sFailedBearBreak = not na(sLastBearBreakLevel) and not na(sBarsSinceBearBreak) and sBarsSinceBearBreak >= 1 and sBarsSinceBearBreak <= failedBreakWindow and close > sLastBearBreakLevel + sATR * acceptanceBufferATR * 0.5 and (sBullDisplacement or (close > open and close > sEMA21))
+
+    // Scanner session gate: external markets can be observed around the clock,
+    // but actionable setup states respect the same enabled trade session.
+    bool sInTradeSession = not na(time(timeframe.period, tradeSession, sessionTimezone))
+    bool sSessionAllowed = not useSessionFilter or sInTradeSession
+
+    // Family 2: either an exceptional first-break impulse, or a later retest that
+    // proves the broken level is actually holding.
+    bool sBullMomentumBreak = sBullBreak and sBullDisplacement and sRVOL >= math.max(strongRVOL, momentumBypassRVOL) and sADX >= strongADX and sPlusDI > sMinusDI and not sSevereChop
+    bool sBearMomentumBreak = sBearBreak and sBearDisplacement and sRVOL >= math.max(strongRVOL, momentumBypassRVOL) and sADX >= strongADX and sMinusDI > sPlusDI and not sSevereChop
+    bool sBullBreakRetestHold = not na(sLastBullBreakLevel) and not na(sBarsSinceBullBreak) and sBarsSinceBullBreak >= 1 and sBarsSinceBullBreak <= failedBreakWindow and low <= sLastBullBreakLevel + sATR * acceptanceBufferATR and close > sLastBullBreakLevel and close > open and (sBullPersistence or sBullDisplacement) and sRVOL >= participationRVOL and not sBearDisplacement and not sSevereChop
+    bool sBearBreakRetestHold = not na(sLastBearBreakLevel) and not na(sBarsSinceBearBreak) and sBarsSinceBearBreak >= 1 and sBarsSinceBearBreak <= failedBreakWindow and high >= sLastBearBreakLevel - sATR * acceptanceBufferATR and close < sLastBearBreakLevel and close < open and (sBearPersistence or sBearDisplacement) and sRVOL >= participationRVOL and not sBullDisplacement and not sSevereChop
+
+    // A real pullback touch must overlap the EMA/VWAP zone. The previous
+    // one-sided comparisons were true even when price was far through a level.
+    bool sEMA21Touch = low <= sEMA21 + sATR * 0.08 and high >= sEMA21 - sATR * 0.08
+    bool sVWAPTouch = low <= sVWAP + sATR * 0.05 and high >= sVWAP - sATR * 0.05
+    bool sBullPullbackTouch = sEMA21Touch or sVWAPTouch
+    bool sBearPullbackTouch = sEMA21Touch or sVWAPTouch
+    bool sBullPullbackReclaim = (sEMA21Touch and close >= sEMA21) or (sVWAPTouch and close >= sVWAP)
+    bool sBearPullbackReclaim = (sEMA21Touch and close <= sEMA21) or (sVWAPTouch and close <= sVWAP)
+
+    int sBarsSinceBearShock = ta.barssince(sBearDisplacement and sRVOL >= participationRVOL)
+    int sBarsSinceBullShock = ta.barssince(sBullDisplacement and sRVOL >= participationRVOL)
+    bool sRecentBearShock = not na(sBarsSinceBearShock) and sBarsSinceBearShock <= oppositeImpulseCooldownBars
+    bool sRecentBullShock = not na(sBarsSinceBullShock) and sBarsSinceBullShock <= oppositeImpulseCooldownBars
+    bool sBullRecovered = not sRecentBearShock or (close > sEMA21 and (sBullDisplacement or (sBullPersistence and sRVOL >= participationRVOL)))
+    bool sBearRecovered = not sRecentBullShock or (close < sEMA21 and (sBearDisplacement or (sBearPersistence and sRVOL >= participationRVOL)))
+
+    bool sBullPullbackFlow = not requirePullbackFlowConfirmation or sRVOL >= participationRVOL or (sBullPersistence and sRVOL >= participationRVOL * 0.90)
+    bool sBearPullbackFlow = not requirePullbackFlowConfirmation or sRVOL >= participationRVOL or (sBearPersistence and sRVOL >= participationRVOL * 0.90)
+    bool sLongPullback = sSessionAllowed and sBullTrend and sBullPullbackTouch and sBullPullbackReclaim and sBullRecovered and sBullPullbackFlow and close > open and close >= (high + low) / 2.0 and sRSI >= 50 and not sBearDisplacement and not sSevereChop
+    bool sShortPullback = sSessionAllowed and sBearTrend and sBearPullbackTouch and sBearPullbackReclaim and sBearRecovered and sBearPullbackFlow and close < open and close <= (high + low) / 2.0 and sRSI <= 50 and not sBullDisplacement and not sSevereChop
+    bool sLongBreakout = sSessionAllowed and (sBullMomentumBreak or sBullBreakRetestHold)
+    bool sShortBreakout = sSessionAllowed and (sBearMomentumBreak or sBearBreakRetestHold)
+
+    // Reversals need a reclaim/structure-style confirmation, not just one
+    // opposite-colored candle after a sweep.
+    bool sBullReversalConfirm = (close > sVWAP or close > sEMA21) and (sBullDisplacement or sBullPersistence or sRSI >= 54)
+    bool sBearReversalConfirm = (close < sVWAP or close < sEMA21) and (sBearDisplacement or sBearPersistence or sRSI <= 46)
+    bool sLongSweep = sSessionAllowed and sLowSweep and close > open and sBullReversalConfirm
+    bool sShortSweep = sSessionAllowed and sHighSweep and close < open and sBearReversalConfirm
+
+    // Family 4 quarantine: do not act on the failure candle itself. Wait for a
+    // later retest/hold plus strong trend recovery in the reversal direction.
+    float sLastFailedBearLevel = ta.valuewhen(sFailedBearBreak, sLastBearBreakLevel, 0)
+    float sLastFailedBullLevel = ta.valuewhen(sFailedBullBreak, sLastBullBreakLevel, 0)
+    int sBarsSinceFailedBear = ta.barssince(sFailedBearBreak)
+    int sBarsSinceFailedBull = ta.barssince(sFailedBullBreak)
+    bool sBullFailedRetest = not na(sLastFailedBearLevel) and not na(sBarsSinceFailedBear) and sBarsSinceFailedBear >= 1 and sBarsSinceFailedBear <= failedBreakWindow and low <= sLastFailedBearLevel + sATR * acceptanceBufferATR and close > sLastFailedBearLevel and close > open
+    bool sBearFailedRetest = not na(sLastFailedBullLevel) and not na(sBarsSinceFailedBull) and sBarsSinceFailedBull >= 1 and sBarsSinceFailedBull <= failedBreakWindow and high >= sLastFailedBullLevel - sATR * acceptanceBufferATR and close < sLastFailedBullLevel and close < open
+    bool sBullFailedStructureShift = sEMA9 > sEMA21 and close > sEMA21 and sBullPersistence
+    bool sBearFailedStructureShift = sEMA9 < sEMA21 and close < sEMA21 and sBearPersistence
+    bool sLongFailedBreak = sSessionAllowed and sBullFailedRetest and sBullFailedStructureShift and sRVOL >= strongRVOL and sBullReversalConfirm
+    bool sShortFailedBreak = sSessionAllowed and sBearFailedRetest and sBearFailedStructureShift and sRVOL >= strongRVOL and sBearReversalConfirm
+
+    int sLongFamily = sLongSweep ? 3 : sLongFailedBreak ? 4 : sLongBreakout ? 2 : sLongPullback ? 1 : 0
+    int sShortFamily = sShortSweep ? 3 : sShortFailedBreak ? 4 : sShortBreakout ? 2 : sShortPullback ? 1 : 0
+
+    bool sLongChased = (sLongFamily == 1 or sLongFamily == 2) and close - sEMA21 >= sATR * maxRecentRunATR
+    bool sShortChased = (sShortFamily == 1 or sShortFamily == 2) and sEMA21 - close >= sATR * maxRecentRunATR
+    float sLongQuality = 50.0
+    sLongQuality += sLongFamily > 0 ? 10.0 : 0.0
+    sLongQuality += sBullTrend ? 8.0 : 0.0
+    sLongQuality += close > sVWAP ? 5.0 : 0.0
+    sLongQuality += sRVOL >= participationRVOL ? 6.0 : 0.0
+    sLongQuality += sRVOL >= strongRVOL ? 3.0 : 0.0
+    sLongQuality += sBullDisplacement ? 7.0 : 0.0
+    sLongQuality += sBullPersistence ? 4.0 : 0.0
+    sLongQuality += sADX >= strongADX and sPlusDI > sMinusDI ? 4.0 : 0.0
+    sLongQuality += sRSI >= 52 ? 3.0 : 0.0
+    sLongQuality += (sLongFamily == 3 or sLongFamily == 4) and (sLowSweep or sFailedBearBreak) ? 3.0 : 0.0
+    sLongQuality -= sSevereChop ? 8.0 : 0.0
+    sLongQuality -= sLongChased ? 7.0 : 0.0
+    sLongQuality := f_clamp(sLongQuality, 50.0, 95.0)
+
+    float sShortQuality = 50.0
+    sShortQuality += sShortFamily > 0 ? 10.0 : 0.0
+    sShortQuality += sBearTrend ? 8.0 : 0.0
+    sShortQuality += close < sVWAP ? 5.0 : 0.0
+    sShortQuality += sRVOL >= participationRVOL ? 6.0 : 0.0
+    sShortQuality += sRVOL >= strongRVOL ? 3.0 : 0.0
+    sShortQuality += sBearDisplacement ? 7.0 : 0.0
+    sShortQuality += sBearPersistence ? 4.0 : 0.0
+    sShortQuality += sADX >= strongADX and sMinusDI > sPlusDI ? 4.0 : 0.0
+    sShortQuality += sRSI <= 48 ? 3.0 : 0.0
+    sShortQuality += (sShortFamily == 3 or sShortFamily == 4) and (sHighSweep or sFailedBullBreak) ? 3.0 : 0.0
+    sShortQuality -= sSevereChop ? 8.0 : 0.0
+    sShortQuality -= sShortChased ? 7.0 : 0.0
+    sShortQuality := f_clamp(sShortQuality, 50.0, 95.0)
+
+    bool sNearEMA21 = low <= sEMA21 + sATR * 0.25 and high >= sEMA21 - sATR * 0.25
+    bool sNearVWAP = low <= sVWAP + sATR * 0.20 and high >= sVWAP - sATR * 0.20
+    bool sWatchLongPullback = sSessionAllowed and sBullTrend and (sNearEMA21 or sNearVWAP) and not sRecentBearShock
+    bool sWatchShortPullback = sSessionAllowed and sBearTrend and (sNearEMA21 or sNearVWAP) and not sRecentBullShock
+    bool sWatchLongBreakout = sSessionAllowed and not na(sLastBullBreakLevel) and not na(sBarsSinceBullBreak) and sBarsSinceBullBreak <= failedBreakWindow and close >= sLastBullBreakLevel - sATR * 0.15
+    bool sWatchShortBreakout = sSessionAllowed and not na(sLastBearBreakLevel) and not na(sBarsSinceBearBreak) and sBarsSinceBearBreak <= failedBreakWindow and close <= sLastBearBreakLevel + sATR * 0.15
+    bool sWatchLongFailed = sSessionAllowed and not na(sBarsSinceFailedBear) and sBarsSinceFailedBear <= failedBreakWindow
+    bool sWatchShortFailed = sSessionAllowed and not na(sBarsSinceFailedBull) and sBarsSinceFailedBull <= failedBreakWindow
+    int sLongWatchFamily = sLowSweep ? 3 : sWatchLongFailed ? 4 : sWatchLongBreakout ? 2 : sWatchLongPullback ? 1 : 0
+    int sShortWatchFamily = sHighSweep ? 3 : sWatchShortFailed ? 4 : sWatchShortBreakout ? 2 : sWatchShortPullback ? 1 : 0
+
+    int sDirection = 0
+    int sFamily = 0
+    float sQuality = 50.0
+    int sStatus = 0
+    if sLongFamily > 0 or sShortFamily > 0
+        bool sChooseLong = sLongFamily > 0 and (sShortFamily == 0 or sLongQuality >= sShortQuality + minProbabilityEdge)
+        bool sChooseShort = sShortFamily > 0 and (sLongFamily == 0 or sShortQuality >= sLongQuality + minProbabilityEdge)
+        if sChooseLong
+            sDirection := 1
+            sFamily := sLongFamily
+            sQuality := sLongQuality
+        else if sChooseShort
+            sDirection := -1
+            sFamily := sShortFamily
+            sQuality := sShortQuality
+        if sDirection != 0
+            sStatus := sQuality >= scannerReadyQuality ? 3 : sQuality >= scannerPromisingQuality ? 2 : 1
+    if sStatus == 0 and (sLongWatchFamily > 0 or sShortWatchFamily > 0)
+        bool sChooseWatchLong = sLongWatchFamily > 0 and (sShortWatchFamily == 0 or sLongQuality >= sShortQuality)
+        sDirection := sChooseWatchLong ? 1 : -1
+        sFamily := sChooseWatchLong ? sLongWatchFamily : sShortWatchFamily
+        sQuality := sChooseWatchLong ? sLongQuality : sShortQuality
+        sStatus := 1
+    [sDirection, sFamily, sQuality, sStatus]
+
+f_scan_family_text(int family) =>
+    family == 1 ? "PULLBACK" : family == 2 ? "BREAKOUT" : family == 3 ? "SWEEP" : family == 4 ? "FAILED BREAK" : "--"
+
+// Compact formatting helpers for resolved performance diagnostics.
+f_diag_rate_text(int wins, int losses) =>
+    int total = wins + losses
+    total > 0 ? str.tostring(wins * 100.0 / total, "#.0") + "% (" + str.tostring(total) + ")" : "--"
+
+f_diag_rate_color(int wins, int losses) =>
+    int total = wins + losses
+    float rate = total > 0 ? wins * 100.0 / total : na
+    total == 0 ? color.white : rate >= 60.0 ? color.lime : rate >= 50.0 ? color.yellow : color.orange
+
+f_family_direction_index(int family, int direction) =>
+    int safeFamily = math.max(1, math.min(4, family))
+    int dirOffset = direction == -1 ? 1 : 0
+    (safeFamily - 1) * 2 + dirOffset
+
+f_scan_status_text(int status) =>
+    status == 3 ? "TRADE READY" : status == 2 ? "PROMISING" : status == 1 ? "WATCHING" : "WAIT"
+
+f_scan_row_text(int direction, int family, float quality, int status) =>
+    status == 0 ? "WAIT" : (direction == 1 ? "LONG" : "SHORT") + " | " + f_scan_family_text(family) + " | Q" + str.tostring(quality, "#.0") + " | " + f_scan_status_text(status)
+
+f_scan_row_color(int direction, int status) =>
+    status == 3 ? (direction == 1 ? color.lime : color.red) : status == 2 ? color.yellow : status == 1 ? color.orange : color.white
+
+// Returns nearest candidate above threshold and a source ID.
+f_pick_above(float threshold, float c1, float c2, float c3, float c4, float c5, float c6, float c7, float c8, float c9, float c10, float c11, float c12) =>
+    float out = na
+    int source = 0
+    if not na(c1) and c1 > threshold
+        out := c1
+        source := 1
+    if not na(c2) and c2 > threshold and (na(out) or c2 < out)
+        out := c2
+        source := 2
+    if not na(c3) and c3 > threshold and (na(out) or c3 < out)
+        out := c3
+        source := 3
+    if not na(c4) and c4 > threshold and (na(out) or c4 < out)
+        out := c4
+        source := 4
+    if not na(c5) and c5 > threshold and (na(out) or c5 < out)
+        out := c5
+        source := 5
+    if not na(c6) and c6 > threshold and (na(out) or c6 < out)
+        out := c6
+        source := 6
+    if not na(c7) and c7 > threshold and (na(out) or c7 < out)
+        out := c7
+        source := 7
+    if not na(c8) and c8 > threshold and (na(out) or c8 < out)
+        out := c8
+        source := 8
+    if not na(c9) and c9 > threshold and (na(out) or c9 < out)
+        out := c9
+        source := 9
+    if not na(c10) and c10 > threshold and (na(out) or c10 < out)
+        out := c10
+        source := 10
+    if not na(c11) and c11 > threshold and (na(out) or c11 < out)
+        out := c11
+        source := 11
+    if not na(c12) and c12 > threshold and (na(out) or c12 < out)
+        out := c12
+        source := 12
+    [out, source]
+
+// Returns nearest candidate below threshold and a source ID.
+f_pick_below(float threshold, float c1, float c2, float c3, float c4, float c5, float c6, float c7, float c8, float c9, float c10, float c11, float c12) =>
+    float out = na
+    int source = 0
+    if not na(c1) and c1 < threshold
+        out := c1
+        source := 1
+    if not na(c2) and c2 < threshold and (na(out) or c2 > out)
+        out := c2
+        source := 2
+    if not na(c3) and c3 < threshold and (na(out) or c3 > out)
+        out := c3
+        source := 3
+    if not na(c4) and c4 < threshold and (na(out) or c4 > out)
+        out := c4
+        source := 4
+    if not na(c5) and c5 < threshold and (na(out) or c5 > out)
+        out := c5
+        source := 5
+    if not na(c6) and c6 < threshold and (na(out) or c6 > out)
+        out := c6
+        source := 6
+    if not na(c7) and c7 < threshold and (na(out) or c7 > out)
+        out := c7
+        source := 7
+    if not na(c8) and c8 < threshold and (na(out) or c8 > out)
+        out := c8
+        source := 8
+    if not na(c9) and c9 < threshold and (na(out) or c9 > out)
+        out := c9
+        source := 9
+    if not na(c10) and c10 < threshold and (na(out) or c10 > out)
+        out := c10
+        source := 10
+    if not na(c11) and c11 < threshold and (na(out) or c11 > out)
+        out := c11
+        source := 11
+    if not na(c12) and c12 < threshold and (na(out) or c12 > out)
+        out := c12
+        source := 12
+    [out, source]
+
+f_closest_support(float entry, float c1, float c2, float c3, float c4, float c5, float c6, float c7) =>
+    float out = na
+    if not na(c1) and c1 < entry
+        out := c1
+    if not na(c2) and c2 < entry and (na(out) or c2 > out)
+        out := c2
+    if not na(c3) and c3 < entry and (na(out) or c3 > out)
+        out := c3
+    if not na(c4) and c4 < entry and (na(out) or c4 > out)
+        out := c4
+    if not na(c5) and c5 < entry and (na(out) or c5 > out)
+        out := c5
+    if not na(c6) and c6 < entry and (na(out) or c6 > out)
+        out := c6
+    if not na(c7) and c7 < entry and (na(out) or c7 > out)
+        out := c7
+    out
+
+f_closest_resistance(float entry, float c1, float c2, float c3, float c4, float c5, float c6, float c7) =>
+    float out = na
+    if not na(c1) and c1 > entry
+        out := c1
+    if not na(c2) and c2 > entry and (na(out) or c2 < out)
+        out := c2
+    if not na(c3) and c3 > entry and (na(out) or c3 < out)
+        out := c3
+    if not na(c4) and c4 > entry and (na(out) or c4 < out)
+        out := c4
+    if not na(c5) and c5 > entry and (na(out) or c5 < out)
+        out := c5
+    if not na(c6) and c6 > entry and (na(out) or c6 < out)
+        out := c6
+    if not na(c7) and c7 > entry and (na(out) or c7 < out)
+        out := c7
+    out
+
+// 4 setup families x 3 coarse volatility-regime groups = 12 buckets.
+int CAL_FAMILIES = 4
+int CAL_REGIMES = 3
+int CAL_SIZE = CAL_FAMILIES * CAL_REGIMES
+var array<float> calWins = array.new_float(CAL_SIZE, 0.0)
+var array<float> calTrials = array.new_float(CAL_SIZE, 0.0)
+var float globalWins = 0.0
+var float globalTrials = 0.0
+
+f_cal_index(int family, int regimeGroup) =>
+    int safeFamily = math.max(1, math.min(CAL_FAMILIES, family))
+    int safeRegime = math.max(0, math.min(CAL_REGIMES - 1, regimeGroup))
+    (safeFamily - 1) * CAL_REGIMES + safeRegime
+
+// =============================================================================
+// BASE INDICATORS / REGIME
+// =============================================================================
+
+float atr = ta.atr(atrLength)
+float atrRank = ta.percentrank(atr, atrRankLookback)
+int volatilityRegime = atrRank < compressionRank ? 0 : atrRank < activeRank ? 1 : atrRank < extremeRank ? 2 : 3
+int calibrationRegime = volatilityRegime == 0 ? 0 : volatilityRegime == 1 ? 1 : 2
+float tp1MaxATR = volatilityRegime == 0 ? tp1MaxATRCompression : volatilityRegime == 1 ? tp1MaxATRNormal : volatilityRegime == 2 ? tp1MaxATRActive : tp1MaxATRExtreme
+float tp2MaxATR = volatilityRegime == 0 ? tp2MaxATRCompression : volatilityRegime == 1 ? tp2MaxATRNormal : volatilityRegime == 2 ? tp2MaxATRActive : tp2MaxATRExtreme
+
+float ema9 = ta.ema(close, emaFastLength)
+float ema21 = ta.ema(close, emaMidLength)
+float ema50 = ta.ema(close, emaSlowLength)
+float vwap = ta.vwap(hlc3)
+float rsi = ta.rsi(close, rsiLength)
+[plusDI, minusDI, adx] = ta.dmi(adxLength, adxSmoothing)
+
+bool emaBull = ema9 > ema21 and ema21 >= ema50
+bool emaBear = ema9 < ema21 and ema21 <= ema50
+bool emaBullTurning = ema9 > ema9[1] and ema21 >= ema21[1]
+bool emaBearTurning = ema9 < ema9[1] and ema21 <= ema21[1]
+bool bullVWAPReclaim = close > vwap and close[1] <= vwap[1]
+bool bearVWAPRejection = close < vwap and close[1] >= vwap[1]
+
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleBody = math.abs(close - open)
+bool bullDisplacement = close > open and candleBody >= candleRange * bodyFraction and candleRange >= atr * displacementATR and close >= high[1]
+bool bearDisplacement = close < open and candleBody >= candleRange * bodyFraction and candleRange >= atr * displacementATR and close <= low[1]
+
+int bullCloses3 = (close > open ? 1 : 0) + (close[1] > open[1] ? 1 : 0) + (close[2] > open[2] ? 1 : 0)
+int bearCloses3 = (close < open ? 1 : 0) + (close[1] < open[1] ? 1 : 0) + (close[2] < open[2] ? 1 : 0)
+bool bullPricePersistence = close > close[2] and bullCloses3 >= 2
+bool bearPricePersistence = close < close[2] and bearCloses3 >= 2
+
+// =============================================================================
+// CONFIRMED 15m CONTEXT - modifier/veto, not universal hard alignment gate.
+// =============================================================================
+
+[htfClose, htfEMA21, htfEMA21Prev, htfEMA50, htfRSI, htfATR] = request.security(
+     syminfo.tickerid,
+     htfTimeframe,
+     [close[1], ta.ema(close, emaMidLength)[1], ta.ema(close, emaMidLength)[2], ta.ema(close, emaSlowLength)[1], ta.rsi(close, rsiLength)[1], ta.atr(atrLength)[1]],
+     lookahead=barmerge.lookahead_on)
+
+bool htfBull = htfClose > htfEMA21 and htfEMA21 >= htfEMA50 and htfEMA21 >= htfEMA21Prev and htfRSI >= 50
+bool htfBear = htfClose < htfEMA21 and htfEMA21 <= htfEMA50 and htfEMA21 <= htfEMA21Prev and htfRSI <= 50
+float htfSeparation = not na(htfATR) and htfATR > 0 ? math.abs(htfEMA21 - htfEMA50) / htfATR : 0.0
+bool htfStrongBull = htfBull and htfRSI >= 55 and htfSeparation >= htfStrongDistanceATR
+bool htfStrongBear = htfBear and htfRSI <= 45 and htfSeparation >= htfStrongDistanceATR
+
+// =============================================================================
+// TIME-OF-DAY RVOL
+// =============================================================================
+
+float volumeAverage = ta.sma(volume, volumeLength)
+float regularRVOL = not na(volumeAverage) and volumeAverage > 0 ? volume / volumeAverage : 1.0
+
+var array<float> todVolumeSum = array.new_float(288, 0.0)
+var array<int> todVolumeCount = array.new_int(288, 0)
+int todMinutes = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
+int todSlot = math.max(0, math.min(287, int(math.floor(todMinutes / 5.0))))
+float todSum = array.get(todVolumeSum, todSlot)
+int todCount = array.get(todVolumeCount, todSlot)
+float todAverage = todCount > 0 ? todSum / todCount : na
+bool todReady = todCount >= todMinSamples
+float todRVOL = todReady and not na(todAverage) and todAverage > 0 ? volume / todAverage : regularRVOL
+float effectiveRVOL = useTimeOfDayRVOL and todReady ? todRVOL : regularRVOL
+
+// v2.4.6D participation context.
+// Standardize the bot's existing time-adjusted RVOL over a 100-bar window.
+// This is used only by the London Pullback gate.
+float londonPBVolMean = ta.sma(effectiveRVOL, 100)
+float londonPBVolStdev = ta.stdev(effectiveRVOL, 100)
+float londonPBVolZ =
+     not na(londonPBVolMean) and not na(londonPBVolStdev) and londonPBVolStdev > 0 ?
+     (effectiveRVOL - londonPBVolMean) / londonPBVolStdev : 0.0
+
+bool participationUseful = effectiveRVOL >= participationRVOL
+bool participationStrong = effectiveRVOL >= strongRVOL
+
+if barstate.isconfirmed and not na(volume) and volume > 0
+    array.set(todVolumeSum, todSlot, todSum + volume)
+    array.set(todVolumeCount, todSlot, todCount + 1)
+
+// =============================================================================
+// LOWER-TF BUY/SELL VOLUME ESTIMATE + DELTA
+// =============================================================================
+
+[oLtf, cLtf, vLtf] = request.security_lower_tf(syminfo.tickerid, deltaTimeframe, [open, close, volume], ignore_invalid_timeframe=true)
+float estimatedBuyVolume = 0.0
+float estimatedSellVolume = 0.0
+int ltfCount = array.size(vLtf)
+
+if useDelta and ltfCount > 0
+    for i = 0 to ltfCount - 1
+        float io = array.get(oLtf, i)
+        float ic = array.get(cLtf, i)
+        float iv = nz(array.get(vLtf, i), 0.0)
+        float prevC = i > 0 ? array.get(cLtf, i - 1) : io
+        if ic > io
+            estimatedBuyVolume += iv
+        else if ic < io
+            estimatedSellVolume += iv
+        else if ic > prevC
+            estimatedBuyVolume += iv
+        else if ic < prevC
+            estimatedSellVolume += iv
+        else
+            estimatedBuyVolume += iv * 0.5
+            estimatedSellVolume += iv * 0.5
+else
+    float fallbackVolume = nz(volume, 0.0)
+    if close > open
+        estimatedBuyVolume := fallbackVolume
+    else if close < open
+        estimatedSellVolume := fallbackVolume
+    else
+        estimatedBuyVolume := fallbackVolume * 0.5
+        estimatedSellVolume := fallbackVolume * 0.5
+
+float estimatedTotalVolume = estimatedBuyVolume + estimatedSellVolume
+float volumeDelta = estimatedBuyVolume - estimatedSellVolume
+float deltaPct = estimatedTotalVolume > 0 ? volumeDelta / estimatedTotalVolume * 100.0 : 0.0
+float deltaPersistence = ta.ema(deltaPct, deltaPersistenceLength)
+bool strongBuyDelta = useDelta and deltaPct >= deltaStrongPct
+bool strongSellDelta = useDelta and deltaPct <= -deltaStrongPct
+bool extremeBuyDelta = useDelta and deltaPct >= deltaExtremePct
+bool extremeSellDelta = useDelta and deltaPct <= -deltaExtremePct
+bool bullFlowSupport = not useDelta ? close >= open : deltaPersistence > -deltaStrongPct * 0.35
+bool bearFlowSupport = not useDelta ? close <= open : deltaPersistence < deltaStrongPct * 0.35
+bool strongBullFlow = not useDelta ? participationStrong and close > open : strongBuyDelta or deltaPersistence >= deltaStrongPct * 0.65
+bool strongBearFlow = not useDelta ? participationStrong and close < open : strongSellDelta or deltaPersistence <= -deltaStrongPct * 0.65
+
+float prior12High = ta.highest(high[1], 12)
+float prior12Low = ta.lowest(low[1], 12)
+bool bearDeltaDivergence = useDelta and high > prior12High and deltaPct <= -deltaStrongPct
+bool bullDeltaDivergence = useDelta and low < prior12Low and deltaPct >= deltaStrongPct
+
+// =============================================================================
+// DAILY + SESSION LEVELS + OR5 / OR15 / OR30
+// =============================================================================
+
+float pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float pdl = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+
+bool inAsia = not na(time(timeframe.period, asiaSession, sessionTimezone))
+bool inLondon = not na(time(timeframe.period, londonSession, sessionTimezone))
+bool inOvernight = not na(time(timeframe.period, overnightSession, sessionTimezone))
+bool inOR5 = not na(time(timeframe.period, or5Session, sessionTimezone))
+bool inOR15 = not na(time(timeframe.period, or15Session, sessionTimezone))
+bool inOR30 = not na(time(timeframe.period, or30Session, sessionTimezone))
+bool inNYOpenWindow = not na(time(timeframe.period, nyOpenWindow, sessionTimezone))
+bool inRTHStats = not na(time(timeframe.period, rthStatsSession, sessionTimezone))
+bool inTradeSession = not na(time(timeframe.period, tradeSession, sessionTimezone))
+bool sessionAllowed = not useSessionFilter or inTradeSession
+
+bool newAsia = inAsia and not inAsia[1]
+bool newLondon = inLondon and not inLondon[1]
+bool newOvernight = inOvernight and not inOvernight[1]
+bool newOR5 = inOR5 and not inOR5[1]
+bool newOR15 = inOR15 and not inOR15[1]
+bool newOR30 = inOR30 and not inOR30[1]
+bool endAsia = not inAsia and inAsia[1]
+bool endLondon = not inLondon and inLondon[1]
+bool endOvernight = not inOvernight and inOvernight[1]
+bool endOR5 = not inOR5 and inOR5[1]
+bool endOR15 = not inOR15 and inOR15[1]
+bool endOR30 = not inOR30 and inOR30[1]
+
+var float asiaLiveHigh = na
+var float asiaLiveLow = na
+var float asiaHigh = na
+var float asiaLow = na
+var float londonLiveHigh = na
+var float londonLiveLow = na
+var float londonHigh = na
+var float londonLow = na
+var float overnightLiveHigh = na
+var float overnightLiveLow = na
+var float overnightHigh = na
+var float overnightLow = na
+var float or5LiveHigh = na
+var float or5LiveLow = na
+var float or5High = na
+var float or5Low = na
+var float or15LiveHigh = na
+var float or15LiveLow = na
+var float or15High = na
+var float or15Low = na
+var float or30LiveHigh = na
+var float or30LiveLow = na
+var float or30High = na
+var float or30Low = na
+
+if newAsia
+    asiaLiveHigh := high
+    asiaLiveLow := low
+else if inAsia
+    asiaLiveHigh := math.max(nz(asiaLiveHigh, high), high)
+    asiaLiveLow := math.min(nz(asiaLiveLow, low), low)
+if endAsia
+    asiaHigh := asiaLiveHigh
+    asiaLow := asiaLiveLow
+
+if newLondon
+    londonLiveHigh := high
+    londonLiveLow := low
+else if inLondon
+    londonLiveHigh := math.max(nz(londonLiveHigh, high), high)
+    londonLiveLow := math.min(nz(londonLiveLow, low), low)
+if endLondon
+    londonHigh := londonLiveHigh
+    londonLow := londonLiveLow
+
+if newOvernight
+    overnightLiveHigh := high
+    overnightLiveLow := low
+else if inOvernight
+    overnightLiveHigh := math.max(nz(overnightLiveHigh, high), high)
+    overnightLiveLow := math.min(nz(overnightLiveLow, low), low)
+if endOvernight
+    overnightHigh := overnightLiveHigh
+    overnightLow := overnightLiveLow
+
+if newOR5
+    or5LiveHigh := high
+    or5LiveLow := low
+else if inOR5
+    or5LiveHigh := math.max(nz(or5LiveHigh, high), high)
+    or5LiveLow := math.min(nz(or5LiveLow, low), low)
+if endOR5
+    or5High := or5LiveHigh
+    or5Low := or5LiveLow
+
+if newOR15
+    or15LiveHigh := high
+    or15LiveLow := low
+else if inOR15
+    or15LiveHigh := math.max(nz(or15LiveHigh, high), high)
+    or15LiveLow := math.min(nz(or15LiveLow, low), low)
+if endOR15
+    or15High := or15LiveHigh
+    or15Low := or15LiveLow
+
+if newOR30
+    or30LiveHigh := high
+    or30LiveLow := low
+else if inOR30
+    or30LiveHigh := math.max(nz(or30LiveHigh, high), high)
+    or30LiveLow := math.min(nz(or30LiveLow, low), low)
+if endOR30
+    or30High := or30LiveHigh
+    or30Low := or30LiveLow
+
+// =============================================================================
+// LOCAL STRUCTURE
+// =============================================================================
+
+float pivotHigh = ta.pivothigh(high, swingLength, swingLength)
+float pivotLow = ta.pivotlow(low, swingLength, swingLength)
+var float lastSwingHigh = na
+var float previousSwingHigh = na
+var float lastSwingLow = na
+var float previousSwingLow = na
+
+if not na(pivotHigh)
+    previousSwingHigh := lastSwingHigh
+    lastSwingHigh := pivotHigh
+if not na(pivotLow)
+    previousSwingLow := lastSwingLow
+    lastSwingLow := pivotLow
+
+var int structureBias = 0
+var int lastStructureBreakBar = na
+bool bullishBreak = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+bool bearishBreak = not na(lastSwingLow) and ta.crossunder(close, lastSwingLow)
+bool bullishCHoCH = bullishBreak and structureBias == -1
+bool bearishCHoCH = bearishBreak and structureBias == 1
+
+if bullishBreak
+    structureBias := 1
+    lastStructureBreakBar := bar_index
+if bearishBreak
+    structureBias := -1
+    lastStructureBreakBar := bar_index
+
+bool structureFresh = not na(lastStructureBreakBar) and bar_index - lastStructureBreakBar <= structureFreshBars
+bool bullStructure = structureFresh and structureBias == 1
+bool bearStructure = structureFresh and structureBias == -1
+
+// =============================================================================
+// SWEEPS / ACCEPTANCE / FAILED ACCEPTANCE
+// =============================================================================
+
+float liquidityHigh = ta.highest(high[1], liquidityLookback)
+float liquidityLow = ta.lowest(low[1], liquidityLookback)
+float sweepBuffer = atr * sessionSweepToleranceATR
+float acceptBuffer = atr * acceptanceBufferATR
+
+bool bullishLiquiditySweep = low < liquidityLow - atr * sweepToleranceATR and close > liquidityLow
+bool bearishLiquiditySweep = high > liquidityHigh + atr * sweepToleranceATR and close < liquidityHigh
+
+bool asiaLowSweep = not na(asiaLow) and low < asiaLow - sweepBuffer and close > asiaLow
+bool londonLowSweep = not na(londonLow) and low < londonLow - sweepBuffer and close > londonLow
+bool overnightLowSweep = not na(overnightLow) and low < overnightLow - sweepBuffer and close > overnightLow
+bool pdlSweep = not na(pdl) and low < pdl - sweepBuffer and close > pdl
+bool or5LowSweep = not na(or5Low) and low < or5Low - sweepBuffer and close > or5Low
+bool or15LowSweep = not na(or15Low) and low < or15Low - sweepBuffer and close > or15Low
+bool or30LowSweep = not na(or30Low) and low < or30Low - sweepBuffer and close > or30Low
+
+bool asiaHighSweep = not na(asiaHigh) and high > asiaHigh + sweepBuffer and close < asiaHigh
+bool londonHighSweep = not na(londonHigh) and high > londonHigh + sweepBuffer and close < londonHigh
+bool overnightHighSweep = not na(overnightHigh) and high > overnightHigh + sweepBuffer and close < overnightHigh
+bool pdhSweep = not na(pdh) and high > pdh + sweepBuffer and close < pdh
+bool or5HighSweep = not na(or5High) and high > or5High + sweepBuffer and close < or5High
+bool or15HighSweep = not na(or15High) and high > or15High + sweepBuffer and close < or15High
+bool or30HighSweep = not na(or30High) and high > or30High + sweepBuffer and close < or30High
+
+bool bullSessionSweep = asiaLowSweep or londonLowSweep or overnightLowSweep or pdlSweep or or5LowSweep or or15LowSweep or or30LowSweep
+bool bearSessionSweep = asiaHighSweep or londonHighSweep or overnightHighSweep or pdhSweep or or5HighSweep or or15HighSweep or or30HighSweep
+
+// Reference level for the actual sweep, used for location and entry anchor.
+float bullSweepLevel = na
+if bullishLiquiditySweep
+    bullSweepLevel := liquidityLow
+if asiaLowSweep and (na(bullSweepLevel) or asiaLow > bullSweepLevel)
+    bullSweepLevel := asiaLow
+if londonLowSweep and (na(bullSweepLevel) or londonLow > bullSweepLevel)
+    bullSweepLevel := londonLow
+if overnightLowSweep and (na(bullSweepLevel) or overnightLow > bullSweepLevel)
+    bullSweepLevel := overnightLow
+if pdlSweep and (na(bullSweepLevel) or pdl > bullSweepLevel)
+    bullSweepLevel := pdl
+if or5LowSweep and (na(bullSweepLevel) or or5Low > bullSweepLevel)
+    bullSweepLevel := or5Low
+if or15LowSweep and (na(bullSweepLevel) or or15Low > bullSweepLevel)
+    bullSweepLevel := or15Low
+if or30LowSweep and (na(bullSweepLevel) or or30Low > bullSweepLevel)
+    bullSweepLevel := or30Low
+
+float bearSweepLevel = na
+if bearishLiquiditySweep
+    bearSweepLevel := liquidityHigh
+if asiaHighSweep and (na(bearSweepLevel) or asiaHigh < bearSweepLevel)
+    bearSweepLevel := asiaHigh
+if londonHighSweep and (na(bearSweepLevel) or londonHigh < bearSweepLevel)
+    bearSweepLevel := londonHigh
+if overnightHighSweep and (na(bearSweepLevel) or overnightHigh < bearSweepLevel)
+    bearSweepLevel := overnightHigh
+if pdhSweep and (na(bearSweepLevel) or pdh < bearSweepLevel)
+    bearSweepLevel := pdh
+if or5HighSweep and (na(bearSweepLevel) or or5High < bearSweepLevel)
+    bearSweepLevel := or5High
+if or15HighSweep and (na(bearSweepLevel) or or15High < bearSweepLevel)
+    bearSweepLevel := or15High
+if or30HighSweep and (na(bearSweepLevel) or or30High < bearSweepLevel)
+    bearSweepLevel := or30High
+
+bool flowConfirmBull = bullFlowSupport and (participationUseful or deltaPersistence > 4 or strongBullFlow)
+bool flowConfirmBear = bearFlowSupport and (participationUseful or deltaPersistence < -4 or strongBearFlow)
+
+bool asiaHighAccepted = not na(asiaHigh) and close > asiaHigh + acceptBuffer and ((close[1] <= asiaHigh + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > asiaHigh + acceptBuffer and close[2] <= asiaHigh + acceptBuffer))
+bool londonHighAccepted = not na(londonHigh) and close > londonHigh + acceptBuffer and ((close[1] <= londonHigh + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > londonHigh + acceptBuffer and close[2] <= londonHigh + acceptBuffer))
+bool overnightHighAccepted = not na(overnightHigh) and close > overnightHigh + acceptBuffer and ((close[1] <= overnightHigh + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > overnightHigh + acceptBuffer and close[2] <= overnightHigh + acceptBuffer))
+bool pdhAccepted = not na(pdh) and close > pdh + acceptBuffer and ((close[1] <= pdh + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > pdh + acceptBuffer and close[2] <= pdh + acceptBuffer))
+bool or5HighAccepted = not na(or5High) and close > or5High + acceptBuffer and ((close[1] <= or5High + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > or5High + acceptBuffer and close[2] <= or5High + acceptBuffer))
+bool or15HighAccepted = not na(or15High) and close > or15High + acceptBuffer and ((close[1] <= or15High + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > or15High + acceptBuffer and close[2] <= or15High + acceptBuffer))
+bool or30HighAccepted = not na(or30High) and close > or30High + acceptBuffer and ((close[1] <= or30High + acceptBuffer and (bullDisplacement or (bullPricePersistence and flowConfirmBull))) or (close[1] > or30High + acceptBuffer and close[2] <= or30High + acceptBuffer))
+
+bool asiaLowAccepted = not na(asiaLow) and close < asiaLow - acceptBuffer and ((close[1] >= asiaLow - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < asiaLow - acceptBuffer and close[2] >= asiaLow - acceptBuffer))
+bool londonLowAccepted = not na(londonLow) and close < londonLow - acceptBuffer and ((close[1] >= londonLow - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < londonLow - acceptBuffer and close[2] >= londonLow - acceptBuffer))
+bool overnightLowAccepted = not na(overnightLow) and close < overnightLow - acceptBuffer and ((close[1] >= overnightLow - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < overnightLow - acceptBuffer and close[2] >= overnightLow - acceptBuffer))
+bool pdlAccepted = not na(pdl) and close < pdl - acceptBuffer and ((close[1] >= pdl - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < pdl - acceptBuffer and close[2] >= pdl - acceptBuffer))
+bool or5LowAccepted = not na(or5Low) and close < or5Low - acceptBuffer and ((close[1] >= or5Low - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < or5Low - acceptBuffer and close[2] >= or5Low - acceptBuffer))
+bool or15LowAccepted = not na(or15Low) and close < or15Low - acceptBuffer and ((close[1] >= or15Low - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < or15Low - acceptBuffer and close[2] >= or15Low - acceptBuffer))
+bool or30LowAccepted = not na(or30Low) and close < or30Low - acceptBuffer and ((close[1] >= or30Low - acceptBuffer and (bearDisplacement or (bearPricePersistence and flowConfirmBear))) or (close[1] < or30Low - acceptBuffer and close[2] >= or30Low - acceptBuffer))
+
+bool bullSessionAcceptance = asiaHighAccepted or londonHighAccepted or overnightHighAccepted or pdhAccepted or or5HighAccepted or or15HighAccepted or or30HighAccepted
+bool bearSessionAcceptance = asiaLowAccepted or londonLowAccepted or overnightLowAccepted or pdlAccepted or or5LowAccepted or or15LowAccepted or or30LowAccepted
+
+float bullAcceptedLevel = na
+if bullishBreak and not na(lastSwingHigh)
+    bullAcceptedLevel := lastSwingHigh
+if asiaHighAccepted and (na(bullAcceptedLevel) or asiaHigh > bullAcceptedLevel)
+    bullAcceptedLevel := asiaHigh
+if londonHighAccepted and (na(bullAcceptedLevel) or londonHigh > bullAcceptedLevel)
+    bullAcceptedLevel := londonHigh
+if overnightHighAccepted and (na(bullAcceptedLevel) or overnightHigh > bullAcceptedLevel)
+    bullAcceptedLevel := overnightHigh
+if pdhAccepted and (na(bullAcceptedLevel) or pdh > bullAcceptedLevel)
+    bullAcceptedLevel := pdh
+if or5HighAccepted and (na(bullAcceptedLevel) or or5High > bullAcceptedLevel)
+    bullAcceptedLevel := or5High
+if or15HighAccepted and (na(bullAcceptedLevel) or or15High > bullAcceptedLevel)
+    bullAcceptedLevel := or15High
+if or30HighAccepted and (na(bullAcceptedLevel) or or30High > bullAcceptedLevel)
+    bullAcceptedLevel := or30High
+
+float bearAcceptedLevel = na
+if bearishBreak and not na(lastSwingLow)
+    bearAcceptedLevel := lastSwingLow
+if asiaLowAccepted and (na(bearAcceptedLevel) or asiaLow < bearAcceptedLevel)
+    bearAcceptedLevel := asiaLow
+if londonLowAccepted and (na(bearAcceptedLevel) or londonLow < bearAcceptedLevel)
+    bearAcceptedLevel := londonLow
+if overnightLowAccepted and (na(bearAcceptedLevel) or overnightLow < bearAcceptedLevel)
+    bearAcceptedLevel := overnightLow
+if pdlAccepted and (na(bearAcceptedLevel) or pdl < bearAcceptedLevel)
+    bearAcceptedLevel := pdl
+if or5LowAccepted and (na(bearAcceptedLevel) or or5Low < bearAcceptedLevel)
+    bearAcceptedLevel := or5Low
+if or15LowAccepted and (na(bearAcceptedLevel) or or15Low < bearAcceptedLevel)
+    bearAcceptedLevel := or15Low
+if or30LowAccepted and (na(bearAcceptedLevel) or or30Low < bearAcceptedLevel)
+    bearAcceptedLevel := or30Low
+
+// Store latest accepted break level so a fast failure can become a reversal setup.
+var float latestBullBreakLevel = na
+var int latestBullBreakBar = na
+var float latestBearBreakLevel = na
+var int latestBearBreakBar = na
+
+if not na(bullAcceptedLevel)
+    latestBullBreakLevel := bullAcceptedLevel
+    latestBullBreakBar := bar_index
+if not na(bearAcceptedLevel)
+    latestBearBreakLevel := bearAcceptedLevel
+    latestBearBreakBar := bar_index
+
+bool recentBullBreak = not na(latestBullBreakBar) and bar_index - latestBullBreakBar <= failedBreakWindow
+bool recentBearBreak = not na(latestBearBreakBar) and bar_index - latestBearBreakBar <= failedBreakWindow
+bool failedBullBreak = recentBullBreak and not na(latestBullBreakLevel) and close < latestBullBreakLevel - acceptBuffer and bearFlowSupport and (bearDisplacement or bearPricePersistence)
+bool failedBearBreak = recentBearBreak and not na(latestBearBreakLevel) and close > latestBearBreakLevel + acceptBuffer and bullFlowSupport and (bullDisplacement or bullPricePersistence)
+
+// =============================================================================
+// ORDER BLOCKS - location modifier, never a standalone setup.
+// =============================================================================
+
+var float bullOBHigh = na
+var float bullOBLow = na
+var int bullOBBar = na
+var float bearOBHigh = na
+var float bearOBLow = na
+var int bearOBBar = na
+var box bullOBBox = na
+var box bearOBBox = na
+
+bool bullImpulse = bullDisplacement and (bullishBreak or bullSessionAcceptance)
+bool bearImpulse = bearDisplacement and (bearishBreak or bearSessionAcceptance)
+
+if bullImpulse
+    float foundHigh = na
+    float foundLow = na
+    int foundBar = na
+    for i = 1 to obSearchBars
+        if na(foundBar) and close[i] < open[i]
+            foundHigh := high[i]
+            foundLow := low[i]
+            foundBar := bar_index - i
+    if not na(foundBar)
+        bullOBHigh := foundHigh
+        bullOBLow := foundLow
+        bullOBBar := foundBar
+        if not na(bullOBBox)
+            box.delete(bullOBBox)
+        if showOrderBlocks
+            bullOBBox := box.new(bullOBBar, bullOBHigh, bar_index + 30, bullOBLow, bgcolor=color.new(color.lime, 88), border_color=color.new(color.lime, 45))
+
+if bearImpulse
+    float foundHigh = na
+    float foundLow = na
+    int foundBar = na
+    for i = 1 to obSearchBars
+        if na(foundBar) and close[i] > open[i]
+            foundHigh := high[i]
+            foundLow := low[i]
+            foundBar := bar_index - i
+    if not na(foundBar)
+        bearOBHigh := foundHigh
+        bearOBLow := foundLow
+        bearOBBar := foundBar
+        if not na(bearOBBox)
+            box.delete(bearOBBox)
+        if showOrderBlocks
+            bearOBBox := box.new(bearOBBar, bearOBHigh, bar_index + 30, bearOBLow, bgcolor=color.new(color.red, 88), border_color=color.new(color.red, 45))
+
+bool bullOBExpired = not na(bullOBBar) and bar_index - bullOBBar > obMaxAge
+bool bearOBExpired = not na(bearOBBar) and bar_index - bearOBBar > obMaxAge
+bool bullOBInvalid = not na(bullOBLow) and close < bullOBLow - atr * obInvalidationATR
+bool bearOBInvalid = not na(bearOBHigh) and close > bearOBHigh + atr * obInvalidationATR
+
+if bullOBExpired or bullOBInvalid
+    bullOBHigh := na
+    bullOBLow := na
+    bullOBBar := na
+    if not na(bullOBBox)
+        box.delete(bullOBBox)
+        bullOBBox := na
+if bearOBExpired or bearOBInvalid
+    bearOBHigh := na
+    bearOBLow := na
+    bearOBBar := na
+    if not na(bearOBBox)
+        box.delete(bearOBBox)
+        bearOBBox := na
+
+if showOrderBlocks and not na(bullOBBox)
+    box.set_right(bullOBBox, bar_index + 30)
+if showOrderBlocks and not na(bearOBBox)
+    box.set_right(bearOBBox, bar_index + 30)
+
+bool inBullOB = not na(bullOBHigh) and low <= bullOBHigh and high >= bullOBLow
+bool inBearOB = not na(bearOBHigh) and high >= bearOBLow and low <= bearOBHigh
+bool bullOBReaction = inBullOB and close > open and close >= (bullOBHigh + bullOBLow) / 2.0
+bool bearOBReaction = inBearOB and close < open and close <= (bearOBHigh + bearOBLow) / 2.0
+bool bearOBAhead = not na(bearOBLow) and bearOBLow > close and bearOBLow - close <= atr * opposingOBDistanceATR
+bool bullOBAhead = not na(bullOBHigh) and bullOBHigh < close and close - bullOBHigh <= atr * opposingOBDistanceATR
+
+// =============================================================================
+// CHOP / ACTIVITY ENVIRONMENT
+// =============================================================================
+
+float emaCross = ta.cross(close, ema21) ? 1.0 : 0.0
+float emaCrossCum = ta.cum(emaCross)
+int chopLookback = 14
+float emaCrossCount = emaCrossCum - nz(emaCrossCum[chopLookback])
+float chopHigh = ta.highest(high, chopLookback)
+float chopLow = ta.lowest(low, chopLookback)
+float chopRangeATR = atr > 0 ? (chopHigh - chopLow) / atr : 999.0
+bool severeChop = (emaCrossCount >= 5 and chopRangeATR <= 2.5 and adx <= 18.0) or (atrRank < 15 and math.abs(ema21 - ema50) <= atr * 0.18)
+
+
+// =============================================================================
+// AMD + INTERMARKET CONTEXT + BOUNDED TRADE EVIDENCE.
+// Cross-market information may confirm an existing reversal setup and shift the
+// directional probability by a capped amount. It never creates setup family #5,
+// never bypasses the mandatory MNQ trigger/geometry gates, and never changes alerts.
+// =============================================================================
+
+[esClose, esHigh, esLow, esATR, esEMA9, esEMA21, esPriorHigh, esPriorLow] = request.security(
+     esSymbol,
+     timeframe.period,
+     [close, high, low, ta.atr(atrLength), ta.ema(close, emaFastLength), ta.ema(close, emaMidLength), ta.highest(high[1], liquidityLookback), ta.lowest(low[1], liquidityLookback)],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+[rtyClose, rtyHigh, rtyLow, rtyATR, rtyEMA9, rtyEMA21, rtyPriorHigh, rtyPriorLow] = request.security(
+     rtySymbol,
+     timeframe.period,
+     [close, high, low, ta.atr(atrLength), ta.ema(close, emaFastLength), ta.ema(close, emaMidLength), ta.highest(high[1], liquidityLookback), ta.lowest(low[1], liquidityLookback)],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+bool esBullContext = not na(esClose) and esClose > esEMA21 and esEMA9 > esEMA21
+bool esBearContext = not na(esClose) and esClose < esEMA21 and esEMA9 < esEMA21
+bool rtyBullContext = not na(rtyClose) and rtyClose > rtyEMA21 and rtyEMA9 > rtyEMA21
+bool rtyBearContext = not na(rtyClose) and rtyClose < rtyEMA21 and rtyEMA9 < rtyEMA21
+bool chartBullContext = close > ema21 and ema9 > ema21
+bool chartBearContext = close < ema21 and ema9 < ema21
+
+bool esLowSweep = not na(esPriorLow) and not na(esATR) and esLow < esPriorLow - esATR * sweepToleranceATR and esClose > esPriorLow
+bool esHighSweep = not na(esPriorHigh) and not na(esATR) and esHigh > esPriorHigh + esATR * sweepToleranceATR and esClose < esPriorHigh
+bool rtyLowSweep = not na(rtyPriorLow) and not na(rtyATR) and rtyLow < rtyPriorLow - rtyATR * sweepToleranceATR and rtyClose > rtyPriorLow
+bool rtyHighSweep = not na(rtyPriorHigh) and not na(rtyATR) and rtyHigh > rtyPriorHigh + rtyATR * sweepToleranceATR and rtyClose < rtyPriorHigh
+
+// AMD approximation: a compact prior range = accumulation; a sweep/reclaim of
+// that range = manipulation; displacement/persistence away from the sweep in the
+// following bars = distribution. AMD remains context/evidence, not a standalone trigger.
+float amdRangeHigh = ta.highest(high[1], amdRangeLookback)
+float amdRangeLow = ta.lowest(low[1], amdRangeLookback)
+float amdRangeATR = not na(atr) and atr > 0 and not na(amdRangeHigh) and not na(amdRangeLow) ? (amdRangeHigh - amdRangeLow) / atr : 999.0
+bool amdCompactBase = amdRangeATR <= amdMaxRangeATR and nz(adx[1], adx) <= amdMaxADX
+bool amdBullManipulation = amdCompactBase and low < amdRangeLow - atr * amdSweepBufferATR and close > amdRangeLow
+bool amdBearManipulation = amdCompactBase and high > amdRangeHigh + atr * amdSweepBufferATR and close < amdRangeHigh
+
+var int lastAMDManipBar = na
+var int lastAMDManipDirection = 0
+if amdBullManipulation and not amdBearManipulation
+    lastAMDManipBar := bar_index
+    lastAMDManipDirection := 1
+else if amdBearManipulation and not amdBullManipulation
+    lastAMDManipBar := bar_index
+    lastAMDManipDirection := -1
+
+bool recentAMDManipulation = not na(lastAMDManipBar) and bar_index - lastAMDManipBar <= amdDistributionWindow
+bool amdBullDistribution = recentAMDManipulation and lastAMDManipDirection == 1 and bar_index > lastAMDManipBar and close > ema21 and bullFlowSupport and (bullDisplacement or bullishBreak or bullPricePersistence)
+bool amdBearDistribution = recentAMDManipulation and lastAMDManipDirection == -1 and bar_index > lastAMDManipBar and close < ema21 and bearFlowSupport and (bearDisplacement or bearishBreak or bearPricePersistence)
+
+string amdPhaseText = not showAMDIntermarket ? "--" : amdBullManipulation ? "MANIP LOW -> BULL" : amdBearManipulation ? "MANIP HIGH -> BEAR" : amdBullDistribution ? "BULL DISTRIBUTION" : amdBearDistribution ? "BEAR DISTRIBUTION" : recentAMDManipulation and lastAMDManipDirection == 1 ? "WAIT BULL DISTRIB" : recentAMDManipulation and lastAMDManipDirection == -1 ? "WAIT BEAR DISTRIB" : amdCompactBase ? "ACCUMULATION" : "SEARCHING"
+color amdPhaseColor = not showAMDIntermarket ? color.white : amdBullDistribution ? color.lime : amdBearDistribution ? color.red : (amdBullManipulation or amdBearManipulation) ? color.orange : amdCompactBase ? color.yellow : color.white
+
+// SMT uses a confirmed-bar synchronization window. We intentionally wait for the
+// window to close instead of using future/lookahead data, so historical and live
+// behavior match. A resolved SMT read is held for the normal failed-break window.
+int chartLowSweepAge = ta.barssince(bullishLiquiditySweep)
+int chartHighSweepAge = ta.barssince(bearishLiquiditySweep)
+int esLowSweepAge = ta.barssince(esLowSweep)
+int esHighSweepAge = ta.barssince(esHighSweep)
+int rtyLowSweepAge = ta.barssince(rtyLowSweep)
+int rtyHighSweepAge = ta.barssince(rtyHighSweep)
+
+bool resolveBullSweepSync = not na(chartLowSweepAge) and chartLowSweepAge == smtSyncWindowBars
+bool resolveBearSweepSync = not na(chartHighSweepAge) and chartHighSweepAge == smtSyncWindowBars
+bool esLowMatchedSync = resolveBullSweepSync and not na(esLowSweepAge) and esLowSweepAge <= smtSyncWindowBars * 2
+bool rtyLowMatchedSync = resolveBullSweepSync and not na(rtyLowSweepAge) and rtyLowSweepAge <= smtSyncWindowBars * 2
+bool esHighMatchedSync = resolveBearSweepSync and not na(esHighSweepAge) and esHighSweepAge <= smtSyncWindowBars * 2
+bool rtyHighMatchedSync = resolveBearSweepSync and not na(rtyHighSweepAge) and rtyHighSweepAge <= smtSyncWindowBars * 2
+
+var int bullSMTvsESUntil = na
+var int bullSMTvsRTYUntil = na
+var int bearSMTvsESUntil = na
+var int bearSMTvsRTYUntil = na
+var int lastBullAlignedSweepBar = na
+var int lastBearAlignedSweepBar = na
+
+if resolveBullSweepSync
+    bullSMTvsESUntil := not esLowMatchedSync ? bar_index + failedBreakWindow : na
+    bullSMTvsRTYUntil := not rtyLowMatchedSync ? bar_index + failedBreakWindow : na
+    if esLowMatchedSync and rtyLowMatchedSync
+        lastBullAlignedSweepBar := bar_index
+if resolveBearSweepSync
+    bearSMTvsESUntil := not esHighMatchedSync ? bar_index + failedBreakWindow : na
+    bearSMTvsRTYUntil := not rtyHighMatchedSync ? bar_index + failedBreakWindow : na
+    if esHighMatchedSync and rtyHighMatchedSync
+        lastBearAlignedSweepBar := bar_index
+
+bool bullSMTvsES = not na(bullSMTvsESUntil) and bar_index <= bullSMTvsESUntil
+bool bullSMTvsRTY = not na(bullSMTvsRTYUntil) and bar_index <= bullSMTvsRTYUntil
+bool bearSMTvsES = not na(bearSMTvsESUntil) and bar_index <= bearSMTvsESUntil
+bool bearSMTvsRTY = not na(bearSMTvsRTYUntil) and bar_index <= bearSMTvsRTYUntil
+
+int bullSMTCount = (bullSMTvsES ? 1 : 0) + (bullSMTvsRTY ? 1 : 0)
+int bearSMTCount = (bearSMTvsES ? 1 : 0) + (bearSMTvsRTY ? 1 : 0)
+bool recentBullAlignedSweep = not na(lastBullAlignedSweepBar) and bar_index - lastBullAlignedSweepBar <= amdDistributionWindow
+bool recentBearAlignedSweep = not na(lastBearAlignedSweepBar) and bar_index - lastBearAlignedSweepBar <= amdDistributionWindow
+
+// A sweep across all three markets is NOT bullish/bearish evidence by itself.
+// It becomes useful only after MNQ actually distributes away from that sweep.
+bool bullAlignedDistributionConfirm = recentBullAlignedSweep and close > ema21 and bullFlowSupport and (bullDisplacement or bullishBreak or bullPricePersistence)
+bool bearAlignedDistributionConfirm = recentBearAlignedSweep and close < ema21 and bearFlowSupport and (bearDisplacement or bearishBreak or bearPricePersistence)
+bool bullTrendAligned = chartBullContext and esBullContext and rtyBullContext
+bool bearTrendAligned = chartBearContext and esBearContext and rtyBearContext
+
+// During an unresolved chart sweep the panel says SYNC CHECK instead of declaring
+// same-bar SMT. Once the window resolves, the held SMT/alignment state is shown.
+bool bullSyncPending = not na(chartLowSweepAge) and chartLowSweepAge < smtSyncWindowBars
+bool bearSyncPending = not na(chartHighSweepAge) and chartHighSweepAge < smtSyncWindowBars
+string esContextText = not showAMDIntermarket ? "--" : bullSyncPending ? "LOW SWEEP SYNC CHECK" : bearSyncPending ? "HIGH SWEEP SYNC CHECK" : bullSMTvsES ? "NO MATCHED LOW SWEEP" : bearSMTvsES ? "NO MATCHED HIGH SWEEP" : esBullContext ? "BULLISH" : esBearContext ? "BEARISH" : "MIXED"
+string rtyContextText = not showAMDIntermarket ? "--" : bullSyncPending ? "LOW SWEEP SYNC CHECK" : bearSyncPending ? "HIGH SWEEP SYNC CHECK" : bullSMTvsRTY ? "NO MATCHED LOW SWEEP" : bearSMTvsRTY ? "NO MATCHED HIGH SWEEP" : rtyBullContext ? "BULLISH" : rtyBearContext ? "BEARISH" : "MIXED"
+color esContextColor = not showAMDIntermarket ? color.white : (bullSyncPending or bearSyncPending) ? color.yellow : bullSMTvsES ? color.lime : bearSMTvsES ? color.red : esBullContext ? color.lime : esBearContext ? color.red : color.yellow
+color rtyContextColor = not showAMDIntermarket ? color.white : (bullSyncPending or bearSyncPending) ? color.yellow : bullSMTvsRTY ? color.lime : bearSMTvsRTY ? color.red : rtyBullContext ? color.lime : rtyBearContext ? color.red : color.yellow
+
+// Reversal confirmation remains local-first. Aligned sweeps only help after MNQ
+// confirms distribution; SMT can help after its synchronization window resolves.
+bool bullCrossMarketReversalConfirm = useAMDIntermarketAnalysis and (amdBullDistribution or bullSMTCount > 0 or bullAlignedDistributionConfirm)
+bool bearCrossMarketReversalConfirm = useAMDIntermarketAnalysis and (amdBearDistribution or bearSMTCount > 0 or bearAlignedDistributionConfirm)
+
+// One bounded net adjustment shifts LONG and SHORT in opposite directions.
+// Plain all-market sweeps are neutral; only confirmed post-sweep distribution
+// receives the alignment weight.
+float intermarketNetAdjustment = 0.0
+if useAMDIntermarketAnalysis
+    intermarketNetAdjustment += amdBullDistribution ? amdProbabilityWeight : amdBearDistribution ? -amdProbabilityWeight : 0.0
+    intermarketNetAdjustment += (bullSMTCount - bearSMTCount) * smtProbabilityWeight
+    intermarketNetAdjustment += (bullTrendAligned or bullAlignedDistributionConfirm) ? alignmentProbabilityWeight : (bearTrendAligned or bearAlignedDistributionConfirm) ? -alignmentProbabilityWeight : 0.0
+intermarketNetAdjustment := f_clamp(intermarketNetAdjustment, -maxIntermarketProbabilityAdjustment, maxIntermarketProbabilityAdjustment)
+float longIntermarketAdjustment = intermarketNetAdjustment
+float shortIntermarketAdjustment = -intermarketNetAdjustment
+string intermarketBiasText = not showAMDIntermarket ? "--" : intermarketNetAdjustment > 0.05 ? "BULL +" + str.tostring(intermarketNetAdjustment, "#.0") : intermarketNetAdjustment < -0.05 ? "BEAR " + str.tostring(intermarketNetAdjustment, "#.0") : "NEUTRAL 0.0"
+color intermarketBiasColor = not showAMDIntermarket ? color.white : intermarketNetAdjustment > 0.05 ? color.lime : intermarketNetAdjustment < -0.05 ? color.red : color.white
+
+string intermarketText = not showAMDIntermarket ? "--" : bullSMTvsES and bullSMTvsRTY ? "BULL SMT x2" : bearSMTvsES and bearSMTvsRTY ? "BEAR SMT x2" : bullSMTvsES ? "BULL SMT vs MES" : bullSMTvsRTY ? "BULL SMT vs M2K" : bearSMTvsES ? "BEAR SMT vs MES" : bearSMTvsRTY ? "BEAR SMT vs M2K" : bullAlignedDistributionConfirm ? "LOW SWEEP -> BULL DIST" : bearAlignedDistributionConfirm ? "HIGH SWEEP -> BEAR DIST" : recentBullAlignedSweep ? "LOW SWEEP ALIGNED - WAIT" : recentBearAlignedSweep ? "HIGH SWEEP ALIGNED - WAIT" : bullSyncPending or bearSyncPending ? "SMT SYNC CHECK" : bullTrendAligned ? "BULL ALIGNED" : bearTrendAligned ? "BEAR ALIGNED" : "MIXED"
+color intermarketColor = not showAMDIntermarket ? color.white : (bullSMTvsES or bullSMTvsRTY or bearSMTvsES or bearSMTvsRTY) ? color.orange : (bullAlignedDistributionConfirm or bullTrendAligned) ? color.lime : (bearAlignedDistributionConfirm or bearTrendAligned) ? color.red : (bullSyncPending or bearSyncPending or recentBullAlignedSweep or recentBearAlignedSweep) ? color.yellow : color.white
+
+
+// =============================================================================
+// MICRO MARKET SCANNER
+// Six independent symbol scans. MGC/MCL are opportunity scans only and never
+// feed the MNQ intermarket probability/SMT layer above.
+// =============================================================================
+
+[mnqScanDirection, mnqScanFamily, mnqScanQuality, mnqScanStatus] = request.security(mnqScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[mesScanDirection, mesScanFamily, mesScanQuality, mesScanStatus] = request.security(mesScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[m2kScanDirection, m2kScanFamily, m2kScanQuality, m2kScanStatus] = request.security(m2kScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[mymScanDirection, mymScanFamily, mymScanQuality, mymScanStatus] = request.security(mymScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[mgcScanDirection, mgcScanFamily, mgcScanQuality, mgcScanStatus] = request.security(mgcScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[mclScanDirection, mclScanFamily, mclScanQuality, mclScanStatus] = request.security(mclScanSymbol, timeframe.period, f_scan_market(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+string mnqScannerText = f_scan_row_text(mnqScanDirection, mnqScanFamily, mnqScanQuality, mnqScanStatus)
+string mesScannerText = f_scan_row_text(mesScanDirection, mesScanFamily, mesScanQuality, mesScanStatus)
+string m2kScannerText = f_scan_row_text(m2kScanDirection, m2kScanFamily, m2kScanQuality, m2kScanStatus)
+string mymScannerText = f_scan_row_text(mymScanDirection, mymScanFamily, mymScanQuality, mymScanStatus)
+string mgcScannerText = f_scan_row_text(mgcScanDirection, mgcScanFamily, mgcScanQuality, mgcScanStatus)
+string mclScannerText = f_scan_row_text(mclScanDirection, mclScanFamily, mclScanQuality, mclScanStatus)
+
+string bestExternalName = ""
+int bestExternalDirection = 0
+int bestExternalFamily = 0
+float bestExternalQuality = -1.0
+int bestExternalStatus = 0
+if mesScanStatus == 3 and mesScanQuality > bestExternalQuality
+    bestExternalName := "MES"
+    bestExternalDirection := mesScanDirection
+    bestExternalFamily := mesScanFamily
+    bestExternalQuality := mesScanQuality
+    bestExternalStatus := mesScanStatus
+if m2kScanStatus == 3 and m2kScanQuality > bestExternalQuality
+    bestExternalName := "M2K"
+    bestExternalDirection := m2kScanDirection
+    bestExternalFamily := m2kScanFamily
+    bestExternalQuality := m2kScanQuality
+    bestExternalStatus := m2kScanStatus
+if mymScanStatus == 3 and mymScanQuality > bestExternalQuality
+    bestExternalName := "MYM"
+    bestExternalDirection := mymScanDirection
+    bestExternalFamily := mymScanFamily
+    bestExternalQuality := mymScanQuality
+    bestExternalStatus := mymScanStatus
+if mgcScanStatus == 3 and mgcScanQuality > bestExternalQuality
+    bestExternalName := "MGC"
+    bestExternalDirection := mgcScanDirection
+    bestExternalFamily := mgcScanFamily
+    bestExternalQuality := mgcScanQuality
+    bestExternalStatus := mgcScanStatus
+if mclScanStatus == 3 and mclScanQuality > bestExternalQuality
+    bestExternalName := "MCL"
+    bestExternalDirection := mclScanDirection
+    bestExternalFamily := mclScanFamily
+    bestExternalQuality := mclScanQuality
+    bestExternalStatus := mclScanStatus
+
+bool betterExternalReady = bestExternalStatus == 3 and (mnqScanStatus != 3 or bestExternalQuality >= mnqScanQuality + scannerBetterEdge)
+string scannerAlertText = betterExternalReady ? "GOOD TRADE READY: " + bestExternalName + " " + (bestExternalDirection == 1 ? "LONG" : "SHORT") + " | " + f_scan_family_text(bestExternalFamily) + " | Q" + str.tostring(bestExternalQuality, "#.0") : "No better external setup ready"
+color scannerAlertColor = betterExternalReady ? (bestExternalDirection == 1 ? color.lime : color.red) : color.white
+
+// =============================================================================
+// FOUR SETUP FAMILIES - internal only.
+// 1 Pullback continuation
+// 2 Breakout / acceptance (includes OR drives/retests)
+// 3 Liquidity sweep reversal
+// 4 Failed-breakout reversal
+// =============================================================================
+
+// Family 1 is continuation-only. HTF/older structure may support probability,
+// but they are no longer allowed to manufacture a pullback against the current
+// 5m trend. Require a locally established trend before the retracement exists.
+float safePullbackATR = math.max(atr, syminfo.mintick)
+float bullPriorExcursionATR = ta.highest((high[1] - ema21[1]) / math.max(atr[1], syminfo.mintick), pullbackTrendLookback)
+float bearPriorExcursionATR = ta.highest((ema21[1] - low[1]) / math.max(atr[1], syminfo.mintick), pullbackTrendLookback)
+bool bullLocalPullbackTrend = ema9 > ema21 and ema21 > ema50 and ema21 > ema21[pullbackSlopeBars] and (ema21 - ema50) / safePullbackATR >= pullbackMinEMASeparationATR and bullPriorExcursionATR >= pullbackMinExcursionATR and not bearStructure
+bool bearLocalPullbackTrend = ema9 < ema21 and ema21 < ema50 and ema21 < ema21[pullbackSlopeBars] and (ema50 - ema21) / safePullbackATR >= pullbackMinEMASeparationATR and bearPriorExcursionATR >= pullbackMinExcursionATR and not bullStructure
+bool bullTrendContext = bullLocalPullbackTrend
+bool bearTrendContext = bearLocalPullbackTrend
+
+// True pullback geometry: the candle must actually overlap a level zone.
+// One-sided checks such as `low <= EMA + tolerance` are too permissive because
+// they remain true when price is far below the EMA.
+bool ema21ZoneTouch = low <= ema21 + atr * 0.08 and high >= ema21 - atr * 0.08
+bool vwapZoneTouch = low <= vwap + atr * 0.05 and high >= vwap - atr * 0.05
+bool bullSwingRetest = not na(lastSwingHigh) and low <= lastSwingHigh + atr * 0.08 and high >= lastSwingHigh - atr * 0.08 and close >= lastSwingHigh
+bool bearSwingRetest = not na(lastSwingLow) and high >= lastSwingLow - atr * 0.08 and low <= lastSwingLow + atr * 0.08 and close <= lastSwingLow
+
+bool bullPullbackTouch = ema21ZoneTouch or vwapZoneTouch or inBullOB or bullSwingRetest
+bool bearPullbackTouch = ema21ZoneTouch or vwapZoneTouch or inBearOB or bearSwingRetest
+bool bullPullbackReclaim = (ema21ZoneTouch and close >= ema21) or (vwapZoneTouch and close >= vwap) or bullOBReaction or bullSwingRetest
+bool bearPullbackReclaim = (ema21ZoneTouch and close <= ema21) or (vwapZoneTouch and close <= vwap) or bearOBReaction or bearSwingRetest
+
+// A continuation setup should not immediately buy the first green candle after
+// a strong bearish impulse (or sell the first red candle after a bullish one).
+// A real recovery can override the brief cooldown.
+int barsSinceBearShock = ta.barssince(bearDisplacement and (participationUseful or strongSellDelta))
+int barsSinceBullShock = ta.barssince(bullDisplacement and (participationUseful or strongBuyDelta))
+bool recentBearShock = not na(barsSinceBearShock) and barsSinceBearShock <= oppositeImpulseCooldownBars
+bool recentBullShock = not na(barsSinceBullShock) and barsSinceBullShock <= oppositeImpulseCooldownBars
+bool bullRecoveredAfterShock = not recentBearShock or bullishCHoCH or bullVWAPReclaim or (bullDisplacement and strongBullFlow) or (close > ema21 and bullPricePersistence and strongBullFlow)
+bool bearRecoveredAfterShock = not recentBullShock or bearishCHoCH or bearVWAPRejection or (bearDisplacement and strongBearFlow) or (close < ema21 and bearPricePersistence and strongBearFlow)
+
+bool bullPullbackFlowConfirmed = not requirePullbackFlowConfirmation or flowConfirmBull
+bool bearPullbackFlowConfirmed = not requirePullbackFlowConfirmation or flowConfirmBear
+bool bullPullbackReaction = bullPullbackTouch and bullPullbackReclaim and close > open and close >= (high + low) / 2.0 and (emaBullTurning or rsi >= 50) and bullFlowSupport and bullPullbackFlowConfirmed and not bearDisplacement
+bool bearPullbackReaction = bearPullbackTouch and bearPullbackReclaim and close < open and close <= (high + low) / 2.0 and (emaBearTurning or rsi <= 50) and bearFlowSupport and bearPullbackFlowConfirmed and not bullDisplacement
+bool longPullbackSetup = bullTrendContext and bullPullbackReaction and bullRecoveredAfterShock and not (severeChop and volatilityRegime == 0)
+bool shortPullbackSetup = bearTrendContext and bearPullbackReaction and bearRecoveredAfterShock and not (severeChop and volatilityRegime == 0)
+
+bool openingDriveBull = inNYOpenWindow and (or5HighAccepted or or15HighAccepted) and bullPricePersistence and participationStrong and bullFlowSupport
+bool openingDriveBear = inNYOpenWindow and (or5LowAccepted or or15LowAccepted) and bearPricePersistence and participationStrong and bearFlowSupport
+
+// Family 2 quality gate. A first break is tradable immediately only when the
+// impulse is exceptional. Otherwise the bot waits for the broken level to be
+// retested and held before calling the breakout actionable.
+bool bullBreakRetestHold = recentBullBreak and not na(latestBullBreakLevel) and bar_index > latestBullBreakBar and low <= latestBullBreakLevel + acceptBuffer and close > latestBullBreakLevel and close > open and flowConfirmBull and (bullPricePersistence or bullDisplacement) and not bearDisplacement and not severeChop
+bool bearBreakRetestHold = recentBearBreak and not na(latestBearBreakLevel) and bar_index > latestBearBreakBar and high >= latestBearBreakLevel - acceptBuffer and close < latestBearBreakLevel and close < open and flowConfirmBear and (bearPricePersistence or bearDisplacement) and not bullDisplacement and not severeChop
+bool longMomentumBreakoutSetup = (bullishBreak or bullSessionAcceptance or openingDriveBull) and bullDisplacement and participationStrong and effectiveRVOL >= momentumBypassRVOL and strongBullFlow and volatilityRegime >= 1 and not severeChop
+bool shortMomentumBreakoutSetup = (bearishBreak or bearSessionAcceptance or openingDriveBear) and bearDisplacement and participationStrong and effectiveRVOL >= momentumBypassRVOL and strongBearFlow and volatilityRegime >= 1 and not severeChop
+bool longBreakoutSetup = longMomentumBreakoutSetup or bullBreakRetestHold
+bool shortBreakoutSetup = shortMomentumBreakoutSetup or bearBreakRetestHold
+
+// Reversal families must show an actual reclaim/structure recovery. Strong
+// delta or cross-market context can support the reversal but no longer replace
+// local price confirmation by themselves.
+bool bullReversalConfirm = bullishCHoCH or bullVWAPReclaim or ((close > ema21 or close > vwap) and (bullPricePersistence or bullDisplacement or strongBuyDelta or bullCrossMarketReversalConfirm))
+bool bearReversalConfirm = bearishCHoCH or bearVWAPRejection or ((close < ema21 or close < vwap) and (bearPricePersistence or bearDisplacement or strongSellDelta or bearCrossMarketReversalConfirm))
+
+bool longSweepSetup = (bullishLiquiditySweep or bullSessionSweep) and close > open and bullFlowSupport and bullReversalConfirm
+bool shortSweepSetup = (bearishLiquiditySweep or bearSessionSweep) and close < open and bearFlowSupport and bearReversalConfirm
+
+// Family 4 quarantine. The initial failed-break candle only starts a candidate.
+// A later retest must hold the reclaimed level, strong flow must agree, and a
+// post-failure local structure shift must have occurred before entry.
+float lastFailedBearLevel = ta.valuewhen(failedBearBreak, latestBearBreakLevel, 0)
+float lastFailedBullLevel = ta.valuewhen(failedBullBreak, latestBullBreakLevel, 0)
+int lastFailedBearBar = ta.valuewhen(failedBearBreak, bar_index, 0)
+int lastFailedBullBar = ta.valuewhen(failedBullBreak, bar_index, 0)
+int lastBullCHoCHBar = ta.valuewhen(bullishCHoCH, bar_index, 0)
+int lastBearCHoCHBar = ta.valuewhen(bearishCHoCH, bar_index, 0)
+int barsSinceFailedBear = ta.barssince(failedBearBreak)
+int barsSinceFailedBull = ta.barssince(failedBullBreak)
+bool bullFailedBreakRetestHold = not na(lastFailedBearLevel) and not na(barsSinceFailedBear) and barsSinceFailedBear >= 1 and barsSinceFailedBear <= failedBreakWindow and low <= lastFailedBearLevel + acceptBuffer and close > lastFailedBearLevel and close > open and not bearDisplacement
+bool bearFailedBreakRetestHold = not na(lastFailedBullLevel) and not na(barsSinceFailedBull) and barsSinceFailedBull >= 1 and barsSinceFailedBull <= failedBreakWindow and high >= lastFailedBullLevel - acceptBuffer and close < lastFailedBullLevel and close < open and not bullDisplacement
+bool bullPostFailureStructureShift = not na(lastFailedBearBar) and not na(lastBullCHoCHBar) and lastBullCHoCHBar > lastFailedBearBar
+bool bearPostFailureStructureShift = not na(lastFailedBullBar) and not na(lastBearCHoCHBar) and lastBearCHoCHBar > lastFailedBullBar
+bool longFailedBreakSetup = bullFailedBreakRetestHold and bullPostFailureStructureShift and strongBullFlow and bullReversalConfirm
+bool shortFailedBreakSetup = bearFailedBreakRetestHold and bearPostFailureStructureShift and strongBearFlow and bearReversalConfirm
+
+int longFamily = 0
+if longSweepSetup
+    longFamily := 3
+else if longFailedBreakSetup
+    longFamily := 4
+else if longBreakoutSetup
+    longFamily := 2
+else if longPullbackSetup
+    longFamily := 1
+
+int shortFamily = 0
+if shortSweepSetup
+    shortFamily := 3
+else if shortFailedBreakSetup
+    shortFamily := 4
+else if shortBreakoutSetup
+    shortFamily := 2
+else if shortPullbackSetup
+    shortFamily := 1
+
+bool longReversalFamily = longFamily == 3 or longFamily == 4
+bool shortReversalFamily = shortFamily == 3 or shortFamily == 4
+
+// =============================================================================
+// ENTRY ANCHOR / INVALIDATION / RISK
+// =============================================================================
+
+float recentHigh = ta.highest(high[1], 40)
+float recentLow = ta.lowest(low[1], 40)
+
+float genericLongAnchor = f_closest_support(close, ema21, vwap, bullOBHigh, lastSwingHigh, bullAcceptedLevel, or15High, or5High)
+float genericShortAnchor = f_closest_resistance(close, ema21, vwap, bearOBLow, lastSwingLow, bearAcceptedLevel, or15Low, or5Low)
+
+float longBreakAnchor = not na(bullAcceptedLevel) ? bullAcceptedLevel : not na(latestBullBreakLevel) ? latestBullBreakLevel : genericLongAnchor
+float shortBreakAnchor = not na(bearAcceptedLevel) ? bearAcceptedLevel : not na(latestBearBreakLevel) ? latestBearBreakLevel : genericShortAnchor
+float longAnchor = longFamily == 2 ? longBreakAnchor : longFamily == 3 and not na(bullSweepLevel) ? bullSweepLevel : longFamily == 4 and not na(lastFailedBearLevel) ? lastFailedBearLevel : genericLongAnchor
+float shortAnchor = shortFamily == 2 ? shortBreakAnchor : shortFamily == 3 and not na(bearSweepLevel) ? bearSweepLevel : shortFamily == 4 and not na(lastFailedBullLevel) ? lastFailedBullLevel : genericShortAnchor
+longAnchor := na(longAnchor) ? ema21 : longAnchor
+shortAnchor := na(shortAnchor) ? ema21 : shortAnchor
+
+float longInvalidationRef = na
+if longFamily == 1
+    longInvalidationRef := not na(bullOBLow) and inBullOB ? bullOBLow : not na(lastSwingLow) ? lastSwingLow : low
+else if longFamily == 2
+    longInvalidationRef := not na(bullAcceptedLevel) ? bullAcceptedLevel : not na(latestBullBreakLevel) ? latestBullBreakLevel : not na(lastSwingLow) ? lastSwingLow : low
+else if longFamily == 3
+    longInvalidationRef := low
+else if longFamily == 4
+    longInvalidationRef := not na(lastFailedBearLevel) ? math.min(low, lastFailedBearLevel) : low
+else
+    longInvalidationRef := not na(lastSwingLow) ? lastSwingLow : close - atr
+
+float shortInvalidationRef = na
+if shortFamily == 1
+    shortInvalidationRef := not na(bearOBHigh) and inBearOB ? bearOBHigh : not na(lastSwingHigh) ? lastSwingHigh : high
+else if shortFamily == 2
+    shortInvalidationRef := not na(bearAcceptedLevel) ? bearAcceptedLevel : not na(latestBearBreakLevel) ? latestBearBreakLevel : not na(lastSwingHigh) ? lastSwingHigh : high
+else if shortFamily == 3
+    shortInvalidationRef := high
+else if shortFamily == 4
+    shortInvalidationRef := not na(lastFailedBullLevel) ? math.max(high, lastFailedBullLevel) : high
+else
+    shortInvalidationRef := not na(lastSwingHigh) ? lastSwingHigh : close + atr
+
+float candidateLongInvalidation = math.min(close - syminfo.mintick, longInvalidationRef - atr * invalidationBufferATR)
+float candidateShortInvalidation = math.max(close + syminfo.mintick, shortInvalidationRef + atr * invalidationBufferATR)
+float candidateLongRiskStop = math.max(close - atr * riskStopATR, candidateLongInvalidation + atr * 0.05)
+candidateLongRiskStop := math.min(close - syminfo.mintick, candidateLongRiskStop)
+float candidateShortRiskStop = math.min(close + atr * riskStopATR, candidateShortInvalidation - atr * 0.05)
+candidateShortRiskStop := math.max(close + syminfo.mintick, candidateShortRiskStop)
+
+float longRiskDistance = math.max(close - candidateLongRiskStop, syminfo.mintick)
+float shortRiskDistance = math.max(candidateShortRiskStop - close, syminfo.mintick)
+bool longRiskGeometryGood = longRiskDistance >= atr * minRiskDistanceATR
+bool shortRiskGeometryGood = shortRiskDistance >= atr * minRiskDistanceATR
+
+// =============================================================================
+// TARGET ENGINE v2
+// Nearest credible objective wins. If that objective is too close, reject trade.
+// If there is no nearby obstacle, a bounded ATR/R fallback is allowed.
+// =============================================================================
+
+float targetThresholdTicks = syminfo.mintick * 2.0
+[rawLongTP1, rawLongTP1Source] = f_pick_above(close + targetThresholdTicks, lastSwingHigh, previousSwingHigh, pdh, asiaHigh, londonHigh, overnightHigh, or5High, or15High, or30High, bearOBLow, recentHigh, na)
+[rawShortTP1, rawShortTP1Source] = f_pick_below(close - targetThresholdTicks, lastSwingLow, previousSwingLow, pdl, asiaLow, londonLow, overnightLow, or5Low, or15Low, or30Low, bullOBHigh, recentLow, na)
+
+float rawLongTP1Distance = not na(rawLongTP1) ? rawLongTP1 - close : na
+float rawShortTP1Distance = not na(rawShortTP1) ? close - rawShortTP1 : na
+float rawLongTP1RR = not na(rawLongTP1Distance) ? rawLongTP1Distance / longRiskDistance : na
+float rawShortTP1RR = not na(rawShortTP1Distance) ? rawShortTP1Distance / shortRiskDistance : na
+float rawLongTP1ATR = not na(rawLongTP1Distance) and atr > 0 ? rawLongTP1Distance / atr : na
+float rawShortTP1ATR = not na(rawShortTP1Distance) and atr > 0 ? rawShortTP1Distance / atr : na
+
+bool longNearestObstacleTooClose = not na(rawLongTP1) and rawLongTP1RR < minimumTP1RR
+bool shortNearestObstacleTooClose = not na(rawShortTP1) and rawShortTP1RR < minimumTP1RR
+bool longRawTP1Usable = not na(rawLongTP1) and rawLongTP1RR >= minimumTP1RR and rawLongTP1RR <= maximumTP1RR and rawLongTP1ATR <= tp1MaxATR
+bool shortRawTP1Usable = not na(rawShortTP1) and rawShortTP1RR >= minimumTP1RR and rawShortTP1RR <= maximumTP1RR and rawShortTP1ATR <= tp1MaxATR
+
+float longFallbackDistance = math.max(minimumTP1RR * longRiskDistance, math.min(tp1FallbackATR * atr, maximumTP1RR * longRiskDistance))
+float shortFallbackDistance = math.max(minimumTP1RR * shortRiskDistance, math.min(tp1FallbackATR * atr, maximumTP1RR * shortRiskDistance))
+float longFallbackTP1 = close + longFallbackDistance
+float shortFallbackTP1 = close - shortFallbackDistance
+bool longFallbackClear = (na(rawLongTP1) or rawLongTP1 > longFallbackTP1) and longFallbackDistance / atr <= tp1MaxATR
+bool shortFallbackClear = (na(rawShortTP1) or rawShortTP1 < shortFallbackTP1) and shortFallbackDistance / atr <= tp1MaxATR
+
+float candidateLongTP1 = longRawTP1Usable ? rawLongTP1 : not longNearestObstacleTooClose and longFallbackClear ? longFallbackTP1 : na
+float candidateShortTP1 = shortRawTP1Usable ? rawShortTP1 : not shortNearestObstacleTooClose and shortFallbackClear ? shortFallbackTP1 : na
+int candidateLongTP1Source = longRawTP1Usable ? rawLongTP1Source : not na(candidateLongTP1) ? 99 : 0
+int candidateShortTP1Source = shortRawTP1Usable ? rawShortTP1Source : not na(candidateShortTP1) ? 99 : 0
+
+// v2.4.6A TARGET QUALITY GATE
+// f_pick_* source map:
+//   5  = London high/low
+//   99 = generic ATR/R fallback
+// A currently usable TP1 must be a non-London structural objective.
+// If the nearest obstacle is too close and a pullback can improve geometry,
+// the directional setup may still enter WAIT; the actual fill is checked again.
+bool longTP1SourceAllowed = candidateLongTP1Source != 5 and candidateLongTP1Source != 99
+bool shortTP1SourceAllowed = candidateShortTP1Source != 5 and candidateShortTP1Source != 99
+
+float longTP2Threshold = not na(candidateLongTP1) ? candidateLongTP1 + atr * tp2MinGapATR : close + atr * tp2FallbackATR
+float shortTP2Threshold = not na(candidateShortTP1) ? candidateShortTP1 - atr * tp2MinGapATR : close - atr * tp2FallbackATR
+[rawLongTP2, rawLongTP2Source] = f_pick_above(longTP2Threshold, lastSwingHigh, previousSwingHigh, pdh, asiaHigh, londonHigh, overnightHigh, or5High, or15High, or30High, bearOBLow, recentHigh, na)
+[rawShortTP2, rawShortTP2Source] = f_pick_below(shortTP2Threshold, lastSwingLow, previousSwingLow, pdl, asiaLow, londonLow, overnightLow, or5Low, or15Low, or30Low, bullOBHigh, recentLow, na)
+
+float longTP2Fallback = close + math.max(tp2FallbackATR * atr, not na(candidateLongTP1) ? (candidateLongTP1 - close) + atr * tp2MinGapATR : tp2FallbackATR * atr)
+float shortTP2Fallback = close - math.max(tp2FallbackATR * atr, not na(candidateShortTP1) ? (close - candidateShortTP1) + atr * tp2MinGapATR : tp2FallbackATR * atr)
+bool rawLongTP2Usable = not na(rawLongTP2) and (rawLongTP2 - close) / atr <= tp2MaxATR
+bool rawShortTP2Usable = not na(rawShortTP2) and (close - rawShortTP2) / atr <= tp2MaxATR
+float candidateLongTP2 = rawLongTP2Usable ? rawLongTP2 : math.min(longTP2Fallback, close + atr * tp2MaxATR)
+float candidateShortTP2 = rawShortTP2Usable ? rawShortTP2 : math.max(shortTP2Fallback, close - atr * tp2MaxATR)
+int candidateLongTP2Source = rawLongTP2Usable ? rawLongTP2Source : 99
+int candidateShortTP2Source = rawShortTP2Usable ? rawShortTP2Source : 99
+
+bool longSpaceGood = longRiskGeometryGood and not na(candidateLongTP1)
+bool shortSpaceGood = shortRiskGeometryGood and not na(candidateShortTP1)
+// If the nearest obstacle is currently too close, a pullback can improve the
+// geometry. Keep the directional setup alive, but never allow an immediate fill.
+bool longSpaceCanImproveOnPullback = longRiskGeometryGood and longNearestObstacleTooClose and not na(rawLongTP1)
+bool shortSpaceCanImproveOnPullback = shortRiskGeometryGood and shortNearestObstacleTooClose and not na(rawShortTP1)
+bool longTargetQualityPotential =
+     not useTargetQualityGate or
+     (longSpaceGood and longTP1SourceAllowed) or
+     (usePullbackEngine and longSpaceCanImproveOnPullback)
+
+bool shortTargetQualityPotential =
+     not useTargetQualityGate or
+     (shortSpaceGood and shortTP1SourceAllowed) or
+     (usePullbackEngine and shortSpaceCanImproveOnPullback)
+
+bool longTargetPotential = (longSpaceGood or (usePullbackEngine and longSpaceCanImproveOnPullback)) and longTargetQualityPotential
+bool shortTargetPotential = (shortSpaceGood or (usePullbackEngine and shortSpaceCanImproveOnPullback)) and shortTargetQualityPotential
+
+// =============================================================================
+// FIVE INDEPENDENT EVIDENCE PILLARS
+// Structure / Location / Participation / Regime / Trigger-Persistence.
+// Trigger is mandatory; the other pillars can substitute instead of multiplying
+// many correlated indicator gates.
+// =============================================================================
+
+bool longStructurePillar = bullStructure or htfBull or (longReversalFamily and bullishCHoCH) or (longFamily == 2 and bullPricePersistence)
+bool shortStructurePillar = bearStructure or htfBear or (shortReversalFamily and bearishCHoCH) or (shortFamily == 2 and bearPricePersistence)
+
+bool longLocationPillar = longFamily == 1 ? bullPullbackTouch : longFamily == 2 ? (bullishBreak or bullSessionAcceptance or openingDriveBull or bullBreakRetestHold) : longFamily == 3 ? (bullSessionSweep or bullishLiquiditySweep) : longFamily == 4 ? bullFailedBreakRetestHold : false
+bool shortLocationPillar = shortFamily == 1 ? bearPullbackTouch : shortFamily == 2 ? (bearishBreak or bearSessionAcceptance or openingDriveBear or bearBreakRetestHold) : shortFamily == 3 ? (bearSessionSweep or bearishLiquiditySweep) : shortFamily == 4 ? bearFailedBreakRetestHold : false
+longLocationPillar := longLocationPillar or bullOBReaction or bullVWAPReclaim
+shortLocationPillar := shortLocationPillar or bearOBReaction or bearVWAPRejection
+
+bool longParticipationPillar = bullFlowSupport and (participationUseful or deltaPersistence > 4 or strongBullFlow)
+bool shortParticipationPillar = bearFlowSupport and (participationUseful or deltaPersistence < -4 or strongBearFlow)
+
+bool longRegimePillar = not severeChop or longReversalFamily or (volatilityRegime >= 2 and bullDisplacement)
+bool shortRegimePillar = not severeChop or shortReversalFamily or (volatilityRegime >= 2 and bearDisplacement)
+
+bool longTriggerPillar = bullPullbackReaction or bullDisplacement or bullishBreak or bullishCHoCH or bullSessionAcceptance or bullBreakRetestHold or longFailedBreakSetup or (bullPricePersistence and close > vwap)
+bool shortTriggerPillar = bearPullbackReaction or bearDisplacement or bearishBreak or bearishCHoCH or bearSessionAcceptance or bearBreakRetestHold or shortFailedBreakSetup or (bearPricePersistence and close < vwap)
+
+int longPillars = (longStructurePillar ? 1 : 0) + (longLocationPillar ? 1 : 0) + (longParticipationPillar ? 1 : 0) + (longRegimePillar ? 1 : 0) + (longTriggerPillar ? 1 : 0)
+int shortPillars = (shortStructurePillar ? 1 : 0) + (shortLocationPillar ? 1 : 0) + (shortParticipationPillar ? 1 : 0) + (shortRegimePillar ? 1 : 0) + (shortTriggerPillar ? 1 : 0)
+
+// Strong opposite HTF only vetoes normal continuation/breakout setups. Explicit
+// reversal families can override it when local structure + participation flip.
+bool longReversalOverride = longReversalFamily and longTriggerPillar and strongBullFlow and (bullishCHoCH or bullVWAPReclaim or longFailedBreakSetup or bullCrossMarketReversalConfirm)
+bool shortReversalOverride = shortReversalFamily and shortTriggerPillar and strongBearFlow and (bearishCHoCH or bearVWAPRejection or shortFailedBreakSetup or bearCrossMarketReversalConfirm)
+bool longHTFQualified = not htfStrongBear or longReversalOverride
+bool shortHTFQualified = not htfStrongBull or shortReversalOverride
+
+int longRequiredPillars = longFamily == 4 ? math.max(minPillars, 4) : minPillars
+int shortRequiredPillars = shortFamily == 4 ? math.max(minPillars, 4) : minPillars
+// v2.4.6D LONDON LOW-VOLUME PULLBACK GATE
+// D6.1 development sample:
+//   London + Pullback + Vol Z < -0.5: 10 trades, 30%, PF 0.52, -$109
+//   RTH    + Pullback + Vol Z < -0.5:  5 trades, 40%, PF 1.27, +$43
+// Rule is intentionally family- and session-specific.
+bool longLondonLowVolPullbackAllowed =
+     not useLondonLowVolPullbackGate or
+     not (longFamily == 1 and inLondon and londonPBVolZ < -0.5)
+
+bool shortLondonLowVolPullbackAllowed =
+     not useLondonLowVolPullbackGate or
+     not (shortFamily == 1 and inLondon and londonPBVolZ < -0.5)
+
+bool longHardCandidate =
+     longFamily > 0 and
+     longLondonLowVolPullbackAllowed and
+     longTriggerPillar and
+     longPillars >= longRequiredPillars and
+     longHTFQualified and
+     longTargetPotential and
+     sessionAllowed
+
+// v2.4.6B SHORT BREAKOUT GATE
+// Family precedence remains unchanged. A bar classified as SHORT BREAKOUT does
+// not silently fall through and become a different family when this gate blocks it.
+bool shortBreakoutFamilyAllowed = not useShortBreakoutGate or shortFamily != 2
+
+bool shortHardCandidate =
+     shortFamily > 0 and
+     shortBreakoutFamilyAllowed and
+     shortLondonLowVolPullbackAllowed and
+     shortTriggerPillar and
+     shortPillars >= shortRequiredPillars and
+     shortHTFQualified and
+     shortTargetPotential and
+     sessionAllowed
+
+// =============================================================================
+// MODEL PRIOR + EMPIRICAL-BAYES CALIBRATION
+// Probability = estimated chance TP1 is reached before a hard stop/invalidation.
+// Early discretionary exits are treated as censored and do not train the bucket.
+// =============================================================================
+
+float longRawProbability = 50.0 + longPillars * 5.5
+longRawProbability += longTriggerPillar ? 3.0 : 0.0
+longRawProbability += strongBullFlow ? 3.0 : 0.0
+longRawProbability += participationStrong ? 2.0 : 0.0
+longRawProbability += bullPricePersistence ? 2.0 : 0.0
+longRawProbability += htfBull ? 2.0 : 0.0
+longRawProbability += (bullSessionSweep or bullSessionAcceptance or openingDriveBull or bullBreakRetestHold) ? 2.5 : 0.0
+longRawProbability += volatilityRegime >= 2 and bullDisplacement ? 2.0 : 0.0
+longRawProbability += adx >= strongADX and plusDI > minusDI ? 1.0 : 0.0
+longRawProbability += rsi >= 52 ? 1.0 : 0.0
+longRawProbability -= bearOBAhead ? 2.0 : 0.0
+longRawProbability -= bearDeltaDivergence ? 3.0 : 0.0
+longRawProbability -= severeChop ? 5.0 : 0.0
+longRawProbability -= htfStrongBear and not longReversalOverride ? 8.0 : 0.0
+longRawProbability += longIntermarketAdjustment
+longRawProbability := f_clamp(longRawProbability, 52.0, 92.0)
+
+float shortRawProbability = 50.0 + shortPillars * 5.5
+shortRawProbability += shortTriggerPillar ? 3.0 : 0.0
+shortRawProbability += strongBearFlow ? 3.0 : 0.0
+shortRawProbability += participationStrong ? 2.0 : 0.0
+shortRawProbability += bearPricePersistence ? 2.0 : 0.0
+shortRawProbability += htfBear ? 2.0 : 0.0
+shortRawProbability += (bearSessionSweep or bearSessionAcceptance or openingDriveBear or bearBreakRetestHold) ? 2.5 : 0.0
+shortRawProbability += volatilityRegime >= 2 and bearDisplacement ? 2.0 : 0.0
+shortRawProbability += adx >= strongADX and minusDI > plusDI ? 1.0 : 0.0
+shortRawProbability += rsi <= 48 ? 1.0 : 0.0
+shortRawProbability -= bullOBAhead ? 2.0 : 0.0
+shortRawProbability -= bullDeltaDivergence ? 3.0 : 0.0
+shortRawProbability -= severeChop ? 5.0 : 0.0
+shortRawProbability -= htfStrongBull and not shortReversalOverride ? 8.0 : 0.0
+shortRawProbability += shortIntermarketAdjustment
+shortRawProbability := f_clamp(shortRawProbability, 52.0, 92.0)
+
+int longCalIndex = f_cal_index(longFamily == 0 ? 1 : longFamily, calibrationRegime)
+int shortCalIndex = f_cal_index(shortFamily == 0 ? 1 : shortFamily, calibrationRegime)
+float longHistWins = array.get(calWins, longCalIndex)
+float longHistTrials = array.get(calTrials, longCalIndex)
+float shortHistWins = array.get(calWins, shortCalIndex)
+float shortHistTrials = array.get(calTrials, shortCalIndex)
+float globalPrior = globalTrials >= 30 ? globalWins / globalTrials : initialGlobalPrior / 100.0
+float longBucketPosterior = (longHistWins + probabilityPriorStrength * globalPrior) / (longHistTrials + probabilityPriorStrength)
+float shortBucketPosterior = (shortHistWins + probabilityPriorStrength * globalPrior) / (shortHistTrials + probabilityPriorStrength)
+float longHistoryWeight = math.min(0.65, longHistTrials / 100.0 * 0.65)
+float shortHistoryWeight = math.min(0.65, shortHistTrials / 100.0 * 0.65)
+float longProbability = longRawProbability * (1.0 - longHistoryWeight) + longBucketPosterior * 100.0 * longHistoryWeight
+float shortProbability = shortRawProbability * (1.0 - shortHistoryWeight) + shortBucketPosterior * 100.0 * shortHistoryWeight
+longProbability := f_clamp(longProbability, 50.0, 92.0)
+shortProbability := f_clamp(shortProbability, 50.0, 92.0)
+
+// Regime-specific qualification: active/open conditions can qualify slightly
+// lower model probabilities; compression/chop requires higher certainty.
+float currentProbabilityThreshold = baseMinProbability
+if inNYOpenWindow and participationStrong and volatilityRegime >= 1
+    currentProbabilityThreshold -= openThresholdDiscount
+else if volatilityRegime >= 2 and participationUseful
+    currentProbabilityThreshold -= activeThresholdDiscount
+if volatilityRegime == 0
+    currentProbabilityThreshold += compressionThresholdPremium
+if severeChop
+    currentProbabilityThreshold += 2.0
+currentProbabilityThreshold := f_clamp(currentProbabilityThreshold, 66.0, 86.0)
+
+bool signalReady = not confirmOnClose or barstate.isconfirmed
+
+var string lastScannerAlertKey = ""
+string scannerAlertKey = betterExternalReady ? bestExternalName + "|" + str.tostring(bestExternalDirection) + "|" + str.tostring(bestExternalFamily) : ""
+if useMicroScannerAlerts and signalReady and betterExternalReady
+    if scannerAlertKey != lastScannerAlertKey
+        alert("TRADE READY - " + bestExternalName + " - " + (bestExternalDirection == 1 ? "LONG" : "SHORT") + " - " + f_scan_family_text(bestExternalFamily) + " - Q" + str.tostring(bestExternalQuality, "#.0"), alert.freq_once_per_bar_close)
+        lastScannerAlertKey := scannerAlertKey
+else
+    lastScannerAlertKey := ""
+bool longProbabilityReady = longHardCandidate and longProbability >= currentProbabilityThreshold
+bool shortProbabilityReady = shortHardCandidate and shortProbability >= currentProbabilityThreshold
+bool longWinsConflict = longProbabilityReady and (not shortProbabilityReady or longProbability - shortProbability >= minProbabilityEdge)
+bool shortWinsConflict = shortProbabilityReady and (not longProbabilityReady or shortProbability - longProbability >= minProbabilityEdge)
+
+// Momentum bypass is execution style, not a separate setup.
+bool longMomentumBypass = bullDisplacement and participationStrong and effectiveRVOL >= momentumBypassRVOL and strongBullFlow and longRawProbability >= momentumBypassProbability and volatilityRegime >= 2 and (longMomentumBreakoutSetup or longFailedBreakSetup)
+bool shortMomentumBypass = bearDisplacement and participationStrong and effectiveRVOL >= momentumBypassRVOL and strongBearFlow and shortRawProbability >= momentumBypassProbability and volatilityRegime >= 2 and (shortMomentumBreakoutSetup or shortFailedBreakSetup)
+
+bool longExtended = close - longAnchor > atr * waitDistanceATR
+bool shortExtended = shortAnchor - close > atr * waitDistanceATR
+
+// =============================================================================
+// ENTRY QUALITY GATE
+// Directional probability can remain high while the current price is a poor
+// entry. These conditions convert ENTER -> WAIT PULLBACK instead of deleting
+// the directional thesis. This specifically targets late continuation entries
+// near short-term exhaustion/local resistance.
+// =============================================================================
+
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float priorImpulseLow = ta.lowest(low[1], recentRunLookback)
+float priorImpulseHigh = ta.highest(high[1], recentRunLookback)
+float longRecentRunATR = atr > 0 ? math.max(0.0, close - priorImpulseLow) / atr : 0.0
+float shortRecentRunATR = atr > 0 ? math.max(0.0, priorImpulseHigh - close) / atr : 0.0
+bool longNearRecentHigh = high >= priorImpulseHigh - atr * 0.08
+bool shortNearRecentLow = low <= priorImpulseLow + atr * 0.08
+bool longFlowFading = useDelta ? (deltaPersistence < deltaPersistence[1] and deltaPct < deltaStrongPct * 0.35) : effectiveRVOL < effectiveRVOL[1]
+bool shortFlowFading = useDelta ? (deltaPersistence > deltaPersistence[1] and deltaPct > -deltaStrongPct * 0.35) : effectiveRVOL < effectiveRVOL[1]
+bool longExhaustion = longNearRecentHigh and ((upperWick >= candleRange * exhaustionWickFraction and longFlowFading) or bearDeltaDivergence or (rsi >= exhaustionRSI and rsi < rsi[1] and effectiveRVOL < effectiveRVOL[1]))
+bool shortExhaustion = shortNearRecentLow and ((lowerWick >= candleRange * exhaustionWickFraction and shortFlowFading) or bullDeltaDivergence or (rsi <= 100.0 - exhaustionRSI and rsi > rsi[1] and effectiveRVOL < effectiveRVOL[1]))
+bool longChased = longRecentRunATR >= maxRecentRunATR
+bool shortChased = shortRecentRunATR >= maxRecentRunATR
+bool longCrowded = (not na(rawLongTP1ATR) and rawLongTP1ATR < minCleanRoomATR) or longNearestObstacleTooClose
+bool shortCrowded = (not na(rawShortTP1ATR) and rawShortTP1ATR < minCleanRoomATR) or shortNearestObstacleTooClose
+bool longOpposingObstacleRisk = bearOBAhead and longRecentRunATR >= maxRecentRunATR * 0.70
+bool shortOpposingObstacleRisk = bullOBAhead and shortRecentRunATR >= maxRecentRunATR * 0.70
+
+// Momentum can bypass a simple distance/chase condition, but never a genuine
+// exhaustion signal or an objectively crowded first target.
+bool longMomentumBypassSafe = longMomentumBypass and not longExhaustion and not longCrowded and not longOpposingObstacleRisk
+bool shortMomentumBypassSafe = shortMomentumBypass and not shortExhaustion and not shortCrowded and not shortOpposingObstacleRisk
+bool longEntryQualityPoor = useEntryQualityGate and (longCrowded or longExhaustion or longOpposingObstacleRisk or (longChased and not longMomentumBypassSafe))
+bool shortEntryQualityPoor = useEntryQualityGate and (shortCrowded or shortExhaustion or shortOpposingObstacleRisk or (shortChased and not shortMomentumBypassSafe))
+
+// =============================================================================
+// SINGLE TRADE STATE
+// 0 IDLE | 1 WAIT PULLBACK | 2 ACTIVE
+// =============================================================================
+
+var int tradeState = 0
+var int tradeDirection = 0
+var int setupBar = na
+var int activeFamily = 0
+var float activeProbability = na
+var float activeEntry = na
+var float activeAnchor = na
+var float activeZoneLow = na
+var float activeZoneHigh = na
+var float activeRiskStop = na
+var float activeInvalidation = na
+var float activeTP1 = na
+var float activeTP2 = na
+var int activeTP1Source = 0
+var int activeTP2Source = 0
+var float activeHealth = na
+var bool activeTP1Hit = false
+var int activeCalIndex = na
+var bool activeCalibrationResolved = false
+var int badHealthBars = 0
+
+// Resolved-trade display statistics. Each active trade resolves only once:
+// WIN = TP1 or TP2 reached. LOSS = risk stop or invalidation reached first.
+// Early discretionary exits and timeouts are intentionally not counted.
+var int resolvedWins = 0
+var int resolvedLosses = 0
+var array<int> resolvedFamilyWins = array.new_int(4, 0)
+var array<int> resolvedFamilyLosses = array.new_int(4, 0)
+// 8 buckets: each family has LONG then SHORT.
+var array<int> resolvedFamilyDirectionWins = array.new_int(8, 0)
+var array<int> resolvedFamilyDirectionLosses = array.new_int(8, 0)
+var int resolvedLongWins = 0
+var int resolvedLongLosses = 0
+var int resolvedShortWins = 0
+var int resolvedShortLosses = 0
+// 4 entry-session buckets: 0 Asia, 1 London, 2 RTH, 3 Other.
+var array<int> resolvedSessionWins = array.new_int(4, 0)
+var array<int> resolvedSessionLosses = array.new_int(4, 0)
+var int activeEntrySession = 3
+var bool activeOutcomeRecorded = false
+
+var float pendingProbability = na
+var int pendingCalIndex = na
+var float pendingAnchor = na
+var float pendingInvalidation = na
+var float pendingRiskStop = na
+var float pendingTP1 = na
+var float pendingTP2 = na
+var int pendingTP1Source = 0
+var int pendingTP2Source = 0
+
+bool createLongSignal = tradeState == 0 and signalReady and longWinsConflict
+bool createShortSignal = tradeState == 0 and signalReady and shortWinsConflict
+
+if createLongSignal
+    bool shouldWait = usePullbackEngine and (longExtended or longEntryQualityPoor) and not longMomentumBypassSafe
+    activeFamily := longFamily
+    setupBar := bar_index
+    if shouldWait
+        tradeState := 1
+        tradeDirection := 1
+        pendingAnchor := longAnchor
+        activeZoneLow := longAnchor - atr * pullbackZoneHalfATR
+        activeZoneHigh := longAnchor + atr * pullbackZoneHalfATR
+        pendingProbability := longProbability
+        pendingCalIndex := longCalIndex
+        pendingInvalidation := candidateLongInvalidation
+        pendingRiskStop := math.max(longAnchor - atr * riskStopATR, candidateLongInvalidation + atr * 0.05)
+        pendingRiskStop := math.min(longAnchor - syminfo.mintick, pendingRiskStop)
+        pendingTP1 := not na(candidateLongTP1) ? candidateLongTP1 : rawLongTP1
+        pendingTP2 := candidateLongTP2
+        pendingTP1Source := not na(candidateLongTP1) ? candidateLongTP1Source : rawLongTP1Source
+        pendingTP2Source := candidateLongTP2Source
+    else
+        tradeState := 2
+        tradeDirection := 1
+        activeProbability := longProbability
+        activeEntry := close
+        activeAnchor := longAnchor
+        activeZoneLow := longAnchor - atr * pullbackZoneHalfATR
+        activeZoneHigh := longAnchor + atr * pullbackZoneHalfATR
+        activeInvalidation := candidateLongInvalidation
+        activeRiskStop := candidateLongRiskStop
+        activeTP1 := candidateLongTP1
+        activeTP2 := candidateLongTP2
+        activeTP1Source := candidateLongTP1Source
+        activeTP2Source := candidateLongTP2Source
+        activeHealth := 100.0
+        activeTP1Hit := false
+        activeOutcomeRecorded := false
+        activeEntrySession := inAsia ? 0 : inLondon ? 1 : inRTHStats ? 2 : 3
+        activeCalIndex := longCalIndex
+        activeCalibrationResolved := false
+        badHealthBars := 0
+
+        // TradingView trade-history mirror.
+        // WIN target = the bot's actual TP1. LOSS stop = the bot's actual Risk Stop.
+        string tvLongEntryMsg = "LONG @ " + str.tostring(activeEntry, format.mintick) + " | SL " + str.tostring(activeRiskStop, format.mintick) + " | TP1 " + str.tostring(activeTP1, format.mintick)
+        strategy.entry("LONG", strategy.long, comment=f_scan_family_text(activeFamily), alert_message=tvLongEntryMsg)
+        strategy.exit("LONG TP1/SL", from_entry="LONG", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+        if showEntryLabels
+            label.new(bar_index, low, "LONG | " + f_scan_family_text(activeFamily) + "\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.small)
+        alert("LONG\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", alert.freq_once_per_bar_close)
+
+if createShortSignal and tradeState == 0
+    bool shouldWait = usePullbackEngine and (shortExtended or shortEntryQualityPoor) and not shortMomentumBypassSafe
+    activeFamily := shortFamily
+    setupBar := bar_index
+    if shouldWait
+        tradeState := 1
+        tradeDirection := -1
+        pendingAnchor := shortAnchor
+        activeZoneLow := shortAnchor - atr * pullbackZoneHalfATR
+        activeZoneHigh := shortAnchor + atr * pullbackZoneHalfATR
+        pendingProbability := shortProbability
+        pendingCalIndex := shortCalIndex
+        pendingInvalidation := candidateShortInvalidation
+        pendingRiskStop := math.min(shortAnchor + atr * riskStopATR, candidateShortInvalidation - atr * 0.05)
+        pendingRiskStop := math.max(shortAnchor + syminfo.mintick, pendingRiskStop)
+        pendingTP1 := not na(candidateShortTP1) ? candidateShortTP1 : rawShortTP1
+        pendingTP2 := candidateShortTP2
+        pendingTP1Source := not na(candidateShortTP1) ? candidateShortTP1Source : rawShortTP1Source
+        pendingTP2Source := candidateShortTP2Source
+    else
+        tradeState := 2
+        tradeDirection := -1
+        activeProbability := shortProbability
+        activeEntry := close
+        activeAnchor := shortAnchor
+        activeZoneLow := shortAnchor - atr * pullbackZoneHalfATR
+        activeZoneHigh := shortAnchor + atr * pullbackZoneHalfATR
+        activeInvalidation := candidateShortInvalidation
+        activeRiskStop := candidateShortRiskStop
+        activeTP1 := candidateShortTP1
+        activeTP2 := candidateShortTP2
+        activeTP1Source := candidateShortTP1Source
+        activeTP2Source := candidateShortTP2Source
+        activeHealth := 100.0
+        activeTP1Hit := false
+        activeOutcomeRecorded := false
+        activeEntrySession := inAsia ? 0 : inLondon ? 1 : inRTHStats ? 2 : 3
+        activeCalIndex := shortCalIndex
+        activeCalibrationResolved := false
+        badHealthBars := 0
+
+        // TradingView trade-history mirror.
+        string tvShortEntryMsg = "SHORT @ " + str.tostring(activeEntry, format.mintick) + " | SL " + str.tostring(activeRiskStop, format.mintick) + " | TP1 " + str.tostring(activeTP1, format.mintick)
+        strategy.entry("SHORT", strategy.short, comment=f_scan_family_text(activeFamily), alert_message=tvShortEntryMsg)
+        strategy.exit("SHORT TP1/SL", from_entry="SHORT", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+        if showEntryLabels
+            label.new(bar_index, high, "SHORT | " + f_scan_family_text(activeFamily) + "\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+        alert("SHORT\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", alert.freq_once_per_bar_close)
+
+// =============================================================================
+// WAIT-PULLBACK STATE
+// Targets are revalidated at the actual fill candle; old geometry does not force
+// a trade if nearby structure changed while waiting.
+// =============================================================================
+
+int pendingAge = tradeState == 1 and not na(setupBar) ? bar_index - setupBar : 0
+bool pendingLongInvalid = tradeState == 1 and tradeDirection == 1 and low <= pendingInvalidation
+bool pendingShortInvalid = tradeState == 1 and tradeDirection == -1 and high >= pendingInvalidation
+bool pendingExpired = tradeState == 1 and pendingAge > pullbackExpiryBars
+bool pendingLongOpposite = tradeState == 1 and tradeDirection == 1 and shortProbabilityReady and shortProbability > pendingProbability + minProbabilityEdge
+bool pendingShortOpposite = tradeState == 1 and tradeDirection == -1 and longProbabilityReady and longProbability > pendingProbability + minProbabilityEdge
+
+bool longZoneTouched = tradeState == 1 and tradeDirection == 1 and bar_index > setupBar and low <= activeZoneHigh and high >= activeZoneLow
+bool shortZoneTouched = tradeState == 1 and tradeDirection == -1 and bar_index > setupBar and high >= activeZoneLow and low <= activeZoneHigh
+float pendingZoneMid = (activeZoneLow + activeZoneHigh) / 2.0
+// Revalidate the live thesis at the actual fill candle. The pending setup still
+// owns its anchor/invalidation, but evidence, HTF qualification, geometry and the
+// directional probability edge must still be good now. This prevents an old 80%
+// WAIT state from filling later while displaying a probability the model no longer has.
+bool longPendingProbabilityValid = longProbability >= currentProbabilityThreshold and (not shortProbabilityReady or longProbability - shortProbability >= minProbabilityEdge)
+bool shortPendingProbabilityValid = shortProbability >= currentProbabilityThreshold and (not longProbabilityReady or shortProbability - longProbability >= minProbabilityEdge)
+bool longPendingTargetQualityValid = not useTargetQualityGate or longTP1SourceAllowed
+bool shortPendingTargetQualityValid = not useTargetQualityGate or shortTP1SourceAllowed
+
+bool longPendingThesisValid = longPillars >= minPillars and longHTFQualified and longSpaceGood and longPendingTargetQualityValid and sessionAllowed and longPendingProbabilityValid
+bool shortPendingThesisValid = shortPillars >= minPillars and shortHTFQualified and shortSpaceGood and shortPendingTargetQualityValid and sessionAllowed and shortPendingProbabilityValid
+bool longPullbackAccepted = longZoneTouched and close > pendingZoneMid and close > open and not strongSellDelta and not bearDisplacement and longPendingThesisValid
+bool shortPullbackAccepted = shortZoneTouched and close < pendingZoneMid and close < open and not strongBuyDelta and not bullDisplacement and shortPendingThesisValid
+
+if signalReady and longPullbackAccepted
+    tradeState := 2
+    setupBar := bar_index
+    activeEntry := close
+    activeProbability := math.min(pendingProbability, longProbability)
+    activeAnchor := pendingAnchor
+    activeInvalidation := math.min(activeEntry - syminfo.mintick, pendingInvalidation)
+    activeRiskStop := math.max(activeEntry - atr * riskStopATR, activeInvalidation + atr * 0.05)
+    activeRiskStop := math.min(activeEntry - syminfo.mintick, activeRiskStop)
+    activeTP1 := candidateLongTP1
+    activeTP2 := candidateLongTP2
+    activeTP1Source := candidateLongTP1Source
+    activeTP2Source := candidateLongTP2Source
+    activeHealth := 100.0
+    activeTP1Hit := false
+    activeOutcomeRecorded := false
+    activeEntrySession := inAsia ? 0 : inLondon ? 1 : inRTHStats ? 2 : 3
+    activeCalIndex := pendingCalIndex
+    activeCalibrationResolved := false
+    badHealthBars := 0
+
+    // TradingView trade-history mirror for an actual WAIT->FILL entry.
+    string tvWaitLongEntryMsg = "LONG @ " + str.tostring(activeEntry, format.mintick) + " | SL " + str.tostring(activeRiskStop, format.mintick) + " | TP1 " + str.tostring(activeTP1, format.mintick)
+    strategy.entry("LONG", strategy.long, comment=f_scan_family_text(activeFamily), alert_message=tvWaitLongEntryMsg)
+    strategy.exit("LONG TP1/SL", from_entry="LONG", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+    if showEntryLabels
+        label.new(bar_index, low, "LONG | " + f_scan_family_text(activeFamily) + "\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.small)
+    alert("LONG\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", alert.freq_once_per_bar_close)
+
+if signalReady and shortPullbackAccepted
+    tradeState := 2
+    setupBar := bar_index
+    activeEntry := close
+    activeProbability := math.min(pendingProbability, shortProbability)
+    activeAnchor := pendingAnchor
+    activeInvalidation := math.max(activeEntry + syminfo.mintick, pendingInvalidation)
+    activeRiskStop := math.min(activeEntry + atr * riskStopATR, activeInvalidation - atr * 0.05)
+    activeRiskStop := math.max(activeEntry + syminfo.mintick, activeRiskStop)
+    activeTP1 := candidateShortTP1
+    activeTP2 := candidateShortTP2
+    activeTP1Source := candidateShortTP1Source
+    activeTP2Source := candidateShortTP2Source
+    activeHealth := 100.0
+    activeTP1Hit := false
+    activeOutcomeRecorded := false
+    activeEntrySession := inAsia ? 0 : inLondon ? 1 : inRTHStats ? 2 : 3
+    activeCalIndex := pendingCalIndex
+    activeCalibrationResolved := false
+    badHealthBars := 0
+
+    // TradingView trade-history mirror for an actual WAIT->FILL entry.
+    string tvWaitShortEntryMsg = "SHORT @ " + str.tostring(activeEntry, format.mintick) + " | SL " + str.tostring(activeRiskStop, format.mintick) + " | TP1 " + str.tostring(activeTP1, format.mintick)
+    strategy.entry("SHORT", strategy.short, comment=f_scan_family_text(activeFamily), alert_message=tvWaitShortEntryMsg)
+    strategy.exit("SHORT TP1/SL", from_entry="SHORT", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+    if showEntryLabels
+        label.new(bar_index, high, "SHORT | " + f_scan_family_text(activeFamily) + "\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    alert("SHORT\nEntry: " + str.tostring(activeEntry, format.mintick) + "\nProbability: " + str.tostring(activeProbability, "#.0") + "%", alert.freq_once_per_bar_close)
+
+if tradeState == 1 and (pendingLongInvalid or pendingShortInvalid or pendingExpired or pendingLongOpposite or pendingShortOpposite)
+    tradeState := 0
+    tradeDirection := 0
+    setupBar := na
+    activeFamily := 0
+    activeZoneLow := na
+    activeZoneHigh := na
+    pendingProbability := na
+    pendingCalIndex := na
+    pendingAnchor := na
+    pendingInvalidation := na
+    pendingRiskStop := na
+    pendingTP1 := na
+    pendingTP2 := na
+    pendingTP1Source := 0
+    pendingTP2Source := 0
+
+// =============================================================================
+// ACTIVE TRADE MANAGEMENT + TRADE HEALTH
+// Five 20-point components + independent failure flags.
+// =============================================================================
+
+int activeAge = tradeState == 2 and not na(setupBar) ? bar_index - setupBar : 0
+bool canManage = tradeState == 2 and bar_index > setupBar
+
+// Keep TradingView's history bracket synced to the bot's fixed active levels.
+// The original internal engine below remains the source of truth.
+if canManage and tradeDirection == 1 and not na(activeTP1) and not na(activeRiskStop)
+    strategy.exit("LONG TP1/SL", from_entry="LONG", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+if canManage and tradeDirection == -1 and not na(activeTP1) and not na(activeRiskStop)
+    strategy.exit("SHORT TP1/SL", from_entry="SHORT", limit=activeTP1, stop=activeRiskStop, comment_profit="TP1", comment_loss="STOP")
+
+bool longTP1Hit = canManage and tradeDirection == 1 and high >= activeTP1
+bool shortTP1Hit = canManage and tradeDirection == -1 and low <= activeTP1
+bool longTP2Hit = canManage and tradeDirection == 1 and high >= activeTP2
+bool shortTP2Hit = canManage and tradeDirection == -1 and low <= activeTP2
+bool longRiskHit = canManage and tradeDirection == 1 and low <= activeRiskStop
+bool shortRiskHit = canManage and tradeDirection == -1 and high >= activeRiskStop
+bool longInvalidationHit = canManage and tradeDirection == 1 and low <= activeInvalidation
+bool shortInvalidationHit = canManage and tradeDirection == -1 and high >= activeInvalidation
+
+bool cleanLongTP1Hit = longTP1Hit and not longRiskHit and not longInvalidationHit
+bool cleanShortTP1Hit = shortTP1Hit and not shortRiskHit and not shortInvalidationHit
+
+if tradeState == 2 and not activeTP1Hit and (cleanLongTP1Hit or cleanShortTP1Hit)
+    activeTP1Hit := true
+    if not activeCalibrationResolved and not na(activeCalIndex)
+        array.set(calTrials, activeCalIndex, array.get(calTrials, activeCalIndex) + 1.0)
+        array.set(calWins, activeCalIndex, array.get(calWins, activeCalIndex) + 1.0)
+        globalTrials += 1.0
+        globalWins += 1.0
+        activeCalibrationResolved := true
+
+bool longNoProgress = tradeState == 2 and tradeDirection == 1 and activeAge >= progressLookbackBars and ta.highest(high, progressLookbackBars) <= activeEntry + atr * 0.25 and close < activeEntry
+bool shortNoProgress = tradeState == 2 and tradeDirection == -1 and activeAge >= progressLookbackBars and ta.lowest(low, progressLookbackBars) >= activeEntry - atr * 0.25 and close > activeEntry
+bool longAdverseProgress = tradeState == 2 and tradeDirection == 1 and close <= activeEntry - (activeEntry - activeRiskStop) * 0.55 and not activeTP1Hit
+bool shortAdverseProgress = tradeState == 2 and tradeDirection == -1 and close >= activeEntry + (activeRiskStop - activeEntry) * 0.55 and not activeTP1Hit
+
+// Immediate-failure check: during the first few bars, only react when the trade
+// has already consumed a meaningful fraction of its allowed risk AND opposing
+// flow/momentum confirms that the trigger failed. This is intentionally much
+// stricter than simply exiting on one red/green candle.
+float activeRiskDistance = tradeState == 2 ? math.max(math.abs(activeEntry - activeRiskStop), syminfo.mintick) : na
+bool longImmediateFailure = tradeState == 2 and tradeDirection == 1 and canManage and activeAge <= immediateFailureBars and not activeTP1Hit and close <= activeEntry - activeRiskDistance * immediateFailureRiskFraction and (bearDisplacement or strongSellDelta) and (close < activeAnchor or close < ema21 or close < vwap)
+bool shortImmediateFailure = tradeState == 2 and tradeDirection == -1 and canManage and activeAge <= immediateFailureBars and not activeTP1Hit and close >= activeEntry + activeRiskDistance * immediateFailureRiskFraction and (bullDisplacement or strongBuyDelta) and (close > activeAnchor or close > ema21 or close > vwap)
+
+bool longStructureFailure = tradeState == 2 and tradeDirection == 1 and (bearishCHoCH or (bearishBreak and close < activeAnchor))
+bool shortStructureFailure = tradeState == 2 and tradeDirection == -1 and (bullishCHoCH or (bullishBreak and close > activeAnchor))
+bool longLevelFailure = tradeState == 2 and tradeDirection == 1 and close < activeZoneLow - atr * 0.08
+bool shortLevelFailure = tradeState == 2 and tradeDirection == -1 and close > activeZoneHigh + atr * 0.08
+bool longFlowFailure = tradeState == 2 and tradeDirection == 1 and (deltaPersistence <= -deltaStrongPct * 0.65 or extremeSellDelta)
+bool shortFlowFailure = tradeState == 2 and tradeDirection == -1 and (deltaPersistence >= deltaStrongPct * 0.65 or extremeBuyDelta)
+bool longMomentumFailure = tradeState == 2 and tradeDirection == 1 and bearDisplacement and (participationUseful or strongSellDelta)
+bool shortMomentumFailure = tradeState == 2 and tradeDirection == -1 and bullDisplacement and (participationUseful or strongBuyDelta)
+bool longProgressFailure = longNoProgress or longAdverseProgress or longImmediateFailure
+bool shortProgressFailure = shortNoProgress or shortAdverseProgress or shortImmediateFailure
+
+int longFailureCount = (longStructureFailure ? 1 : 0) + (longLevelFailure ? 1 : 0) + (longFlowFailure ? 1 : 0) + (longMomentumFailure ? 1 : 0) + (longProgressFailure ? 1 : 0)
+int shortFailureCount = (shortStructureFailure ? 1 : 0) + (shortLevelFailure ? 1 : 0) + (shortFlowFailure ? 1 : 0) + (shortMomentumFailure ? 1 : 0) + (shortProgressFailure ? 1 : 0)
+int activeFailureCount = tradeDirection == 1 ? longFailureCount : tradeDirection == -1 ? shortFailureCount : 0
+
+float structureHealth = tradeDirection == 1 ? (longStructureFailure ? 0.0 : 20.0) : tradeDirection == -1 ? (shortStructureFailure ? 0.0 : 20.0) : 0.0
+float levelHealth = tradeDirection == 1 ? (longLevelFailure ? 0.0 : close >= activeEntry ? 20.0 : 12.0) : tradeDirection == -1 ? (shortLevelFailure ? 0.0 : close <= activeEntry ? 20.0 : 12.0) : 0.0
+float flowHealth = 20.0
+if tradeDirection == 1
+    flowHealth := extremeSellDelta ? 0.0 : strongSellDelta ? 5.0 : deltaPersistence < 0 ? 12.0 : 20.0
+if tradeDirection == -1
+    flowHealth := extremeBuyDelta ? 0.0 : strongBuyDelta ? 5.0 : deltaPersistence > 0 ? 12.0 : 20.0
+float momentumHealth = 20.0
+if tradeDirection == 1
+    momentumHealth := longMomentumFailure ? 0.0 : rsi < 45 ? 10.0 : close < vwap and close < ema21 ? 12.0 : 20.0
+if tradeDirection == -1
+    momentumHealth := shortMomentumFailure ? 0.0 : rsi > 55 ? 10.0 : close > vwap and close > ema21 ? 12.0 : 20.0
+float progressHealth = tradeDirection == 1 ? (longImmediateFailure ? 0.0 : longProgressFailure ? 5.0 : close > activeEntry ? 20.0 : 12.0) : tradeDirection == -1 ? (shortImmediateFailure ? 0.0 : shortProgressFailure ? 5.0 : close < activeEntry ? 20.0 : 12.0) : 0.0
+float rawHealth = f_clamp(structureHealth + levelHealth + flowHealth + momentumHealth + progressHealth, 0.0, 100.0)
+
+if tradeState == 2
+    activeHealth := canManage ? (na(activeHealth) ? rawHealth : activeHealth * 0.35 + rawHealth * 0.65) : 100.0
+else
+    activeHealth := na
+
+bool threeFailures = useTradeHealth and tradeState == 2 and canManage and activeFailureCount >= 3
+if threeFailures
+    badHealthBars += 1
+else
+    badHealthBars := 0
+
+bool emergencyExit = useTradeHealth and tradeState == 2 and canManage and activeFailureCount >= 4
+bool immediateFailureExit = useTradeHealth and signalReady and (longImmediateFailure or shortImmediateFailure)
+bool confirmedSoftExit = useTradeHealth and tradeState == 2 and canManage and badHealthBars >= earlyExitConfirmBars
+bool earlyExitNow = signalReady and (immediateFailureExit or emergencyExit or confirmedSoftExit) and not (longRiskHit or shortRiskHit or longInvalidationHit or shortInvalidationHit or longTP2Hit or shortTP2Hit)
+
+if earlyExitNow
+    string exitText = tradeDirection == 1 ? "EXIT LONG NOW" : "EXIT SHORT NOW"
+    label.new(bar_index, high + atr * 0.20, exitText, style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, size=size.normal)
+    alert(exitText, alert.freq_once_per_bar_close)
+
+bool hardFailure = longRiskHit or shortRiskHit or longInvalidationHit or shortInvalidationHit
+bool targetFinished = longTP2Hit or shortTP2Hit
+bool tradeExpired = tradeState == 2 and activeAge > maxTradeBars
+bool finishTrade = earlyExitNow or hardFailure or targetFinished or tradeExpired
+
+// Keep TradingView's trade list synchronized with the bot's discretionary finish.
+// TP1 / Risk Stop are already handled by the bracket. TP2 necessarily implies
+// TP1 was reached first for normal fixed geometry, so the tester will already
+// have recorded the target win.
+bool tvDiscretionaryClose = (earlyExitNow or tradeExpired) and not hardFailure and not activeTP1Hit
+if tvDiscretionaryClose and tradeDirection == 1
+    strategy.close("LONG", comment=earlyExitNow ? "EARLY EXIT" : "TIMEOUT")
+if tvDiscretionaryClose and tradeDirection == -1
+    strategy.close("SHORT", comment=earlyExitNow ? "EARLY EXIT" : "TIMEOUT")
+
+// User-facing W/L accounting. Reaching either profit target resolves a WIN.
+// If target and stop/invalidation both occur inside the same historical 5m bar,
+// target takes precedence to match the requested "any profit target = win" rule.
+bool anyProfitTargetHit = longTP1Hit or shortTP1Hit or longTP2Hit or shortTP2Hit
+if tradeState == 2 and canManage and not activeOutcomeRecorded
+    if anyProfitTargetHit
+        resolvedWins += 1
+        if tradeDirection == 1
+            resolvedLongWins += 1
+        else if tradeDirection == -1
+            resolvedShortWins += 1
+        if activeEntrySession >= 0 and activeEntrySession <= 3
+            array.set(resolvedSessionWins, activeEntrySession, array.get(resolvedSessionWins, activeEntrySession) + 1)
+        if activeFamily >= 1 and activeFamily <= 4
+            int familyWinIndex = activeFamily - 1
+            int familyDirectionWinIndex = f_family_direction_index(activeFamily, tradeDirection)
+            array.set(resolvedFamilyWins, familyWinIndex, array.get(resolvedFamilyWins, familyWinIndex) + 1)
+            array.set(resolvedFamilyDirectionWins, familyDirectionWinIndex, array.get(resolvedFamilyDirectionWins, familyDirectionWinIndex) + 1)
+        activeOutcomeRecorded := true
+    else if hardFailure
+        resolvedLosses += 1
+        if tradeDirection == 1
+            resolvedLongLosses += 1
+        else if tradeDirection == -1
+            resolvedShortLosses += 1
+        if activeEntrySession >= 0 and activeEntrySession <= 3
+            array.set(resolvedSessionLosses, activeEntrySession, array.get(resolvedSessionLosses, activeEntrySession) + 1)
+        if activeFamily >= 1 and activeFamily <= 4
+            int familyLossIndex = activeFamily - 1
+            int familyDirectionLossIndex = f_family_direction_index(activeFamily, tradeDirection)
+            array.set(resolvedFamilyLosses, familyLossIndex, array.get(resolvedFamilyLosses, familyLossIndex) + 1)
+            array.set(resolvedFamilyDirectionLosses, familyDirectionLossIndex, array.get(resolvedFamilyDirectionLosses, familyDirectionLossIndex) + 1)
+        activeOutcomeRecorded := true
+
+// Only hard failures resolve an unresolved TP1 probability as a loss. Early
+// discretionary exits/timeouts are censored instead of corrupting calibration.
+if tradeState == 2 and hardFailure and not activeTP1Hit and not activeCalibrationResolved and not na(activeCalIndex)
+    array.set(calTrials, activeCalIndex, array.get(calTrials, activeCalIndex) + 1.0)
+    globalTrials += 1.0
+    activeCalibrationResolved := true
+
+if finishTrade
+    tradeState := 0
+    tradeDirection := 0
+    setupBar := na
+    activeFamily := 0
+    activeProbability := na
+    activeEntry := na
+    activeAnchor := na
+    activeZoneLow := na
+    activeZoneHigh := na
+    activeRiskStop := na
+    activeInvalidation := na
+    activeTP1 := na
+    activeTP2 := na
+    activeTP1Source := 0
+    activeTP2Source := 0
+    activeHealth := na
+    activeTP1Hit := false
+    activeOutcomeRecorded := false
+    activeEntrySession := 3
+    activeCalIndex := na
+    activeCalibrationResolved := false
+    badHealthBars := 0
+    pendingProbability := na
+    pendingCalIndex := na
+    pendingAnchor := na
+    pendingInvalidation := na
+    pendingRiskStop := na
+    pendingTP1 := na
+    pendingTP2 := na
+    pendingTP1Source := 0
+    pendingTP2Source := 0
+
+// =============================================================================
+// DISPLAY STATE
+// =============================================================================
+
+string directionText = tradeState > 0 ? (tradeDirection == 1 ? "LONG" : "SHORT") : "WAIT"
+string stateText = tradeState == 2 ? "ACTIVE" : tradeState == 1 ? "WAIT PULLBACK" : "WAIT"
+float pendingDisplayedProbability = tradeState == 1 ? (tradeDirection == 1 ? math.min(pendingProbability, longProbability) : tradeDirection == -1 ? math.min(pendingProbability, shortProbability) : pendingProbability) : na
+string probabilityText = tradeState == 2 ? str.tostring(activeProbability, "#.0") + "%" : tradeState == 1 ? str.tostring(pendingDisplayedProbability, "#.0") + "%" : "--"
+string entryText = tradeState == 2 ? str.tostring(activeEntry, format.mintick) : tradeState == 1 ? "WAIT" : "--"
+string zoneText = tradeState > 0 and not na(activeZoneLow) and not na(activeZoneHigh) ? str.tostring(activeZoneLow, format.mintick) + " - " + str.tostring(activeZoneHigh, format.mintick) : "--"
+string riskText = tradeState == 2 ? str.tostring(activeRiskStop, format.mintick) : tradeState == 1 ? str.tostring(pendingRiskStop, format.mintick) : "--"
+string invalidationText = tradeState == 2 ? str.tostring(activeInvalidation, format.mintick) : tradeState == 1 ? str.tostring(pendingInvalidation, format.mintick) : "--"
+string tp1Text = tradeState == 2 ? str.tostring(activeTP1, format.mintick) : tradeState == 1 ? str.tostring(pendingTP1, format.mintick) : "--"
+string tp2Text = tradeState == 2 ? str.tostring(activeTP2, format.mintick) : tradeState == 1 ? str.tostring(pendingTP2, format.mintick) : "--"
+string healthText = tradeState == 2 ? str.tostring(activeHealth, "#.0") + "/100 " + (activeHealth >= 80 ? "STRONG" : activeHealth >= healthWarningLevel ? "HEALTHY" : activeFailureCount >= 3 ? "EXIT RISK" : "WEAKENING") : "--"
+float calibrationSamples = tradeState == 2 and not na(activeCalIndex) ? array.get(calTrials, activeCalIndex) : tradeState == 1 and not na(pendingCalIndex) ? array.get(calTrials, pendingCalIndex) : 0.0
+int resolvedTrades = resolvedWins + resolvedLosses
+float resolvedWinRate = resolvedTrades > 0 ? resolvedWins * 100.0 / resolvedTrades : na
+string resolvedRecordText = str.tostring(resolvedWins) + "W - " + str.tostring(resolvedLosses) + "L"
+string resolvedWinRateText = resolvedTrades > 0 ? str.tostring(resolvedWinRate, "#.0") + "% (" + str.tostring(resolvedTrades) + ")" : "--"
+color resolvedWinRateColor = resolvedTrades == 0 ? color.white : resolvedWinRate >= 60.0 ? color.lime : resolvedWinRate >= 50.0 ? color.yellow : color.orange
+int pullbackResolved = array.get(resolvedFamilyWins, 0) + array.get(resolvedFamilyLosses, 0)
+int breakoutResolved = array.get(resolvedFamilyWins, 1) + array.get(resolvedFamilyLosses, 1)
+int sweepResolved = array.get(resolvedFamilyWins, 2) + array.get(resolvedFamilyLosses, 2)
+int failedBreakResolved = array.get(resolvedFamilyWins, 3) + array.get(resolvedFamilyLosses, 3)
+float pullbackWinRate = pullbackResolved > 0 ? array.get(resolvedFamilyWins, 0) * 100.0 / pullbackResolved : na
+float breakoutWinRate = breakoutResolved > 0 ? array.get(resolvedFamilyWins, 1) * 100.0 / breakoutResolved : na
+float sweepWinRate = sweepResolved > 0 ? array.get(resolvedFamilyWins, 2) * 100.0 / sweepResolved : na
+float failedBreakWinRate = failedBreakResolved > 0 ? array.get(resolvedFamilyWins, 3) * 100.0 / failedBreakResolved : na
+
+int pullbackLongWins = array.get(resolvedFamilyDirectionWins, 0)
+int pullbackLongLosses = array.get(resolvedFamilyDirectionLosses, 0)
+int pullbackShortWins = array.get(resolvedFamilyDirectionWins, 1)
+int pullbackShortLosses = array.get(resolvedFamilyDirectionLosses, 1)
+int breakoutLongWins = array.get(resolvedFamilyDirectionWins, 2)
+int breakoutLongLosses = array.get(resolvedFamilyDirectionLosses, 2)
+int breakoutShortWins = array.get(resolvedFamilyDirectionWins, 3)
+int breakoutShortLosses = array.get(resolvedFamilyDirectionLosses, 3)
+int sweepLongWins = array.get(resolvedFamilyDirectionWins, 4)
+int sweepLongLosses = array.get(resolvedFamilyDirectionLosses, 4)
+int sweepShortWins = array.get(resolvedFamilyDirectionWins, 5)
+int sweepShortLosses = array.get(resolvedFamilyDirectionLosses, 5)
+int failedLongWins = array.get(resolvedFamilyDirectionWins, 6)
+int failedLongLosses = array.get(resolvedFamilyDirectionLosses, 6)
+int failedShortWins = array.get(resolvedFamilyDirectionWins, 7)
+int failedShortLosses = array.get(resolvedFamilyDirectionLosses, 7)
+
+string pullbackDiagText = f_diag_rate_text(array.get(resolvedFamilyWins, 0), array.get(resolvedFamilyLosses, 0)) + " | L " + f_diag_rate_text(pullbackLongWins, pullbackLongLosses) + " | S " + f_diag_rate_text(pullbackShortWins, pullbackShortLosses)
+string breakoutDiagText = f_diag_rate_text(array.get(resolvedFamilyWins, 1), array.get(resolvedFamilyLosses, 1)) + " | L " + f_diag_rate_text(breakoutLongWins, breakoutLongLosses) + " | S " + f_diag_rate_text(breakoutShortWins, breakoutShortLosses)
+string sweepDiagText = f_diag_rate_text(array.get(resolvedFamilyWins, 2), array.get(resolvedFamilyLosses, 2)) + " | L " + f_diag_rate_text(sweepLongWins, sweepLongLosses) + " | S " + f_diag_rate_text(sweepShortWins, sweepShortLosses)
+string failedBreakDiagText = f_diag_rate_text(array.get(resolvedFamilyWins, 3), array.get(resolvedFamilyLosses, 3)) + " | L " + f_diag_rate_text(failedLongWins, failedLongLosses) + " | S " + f_diag_rate_text(failedShortWins, failedShortLosses)
+string directionDiagText = "L " + f_diag_rate_text(resolvedLongWins, resolvedLongLosses) + " | S " + f_diag_rate_text(resolvedShortWins, resolvedShortLosses)
+
+int asiaWins = array.get(resolvedSessionWins, 0)
+int asiaLosses = array.get(resolvedSessionLosses, 0)
+int londonWins = array.get(resolvedSessionWins, 1)
+int londonLosses = array.get(resolvedSessionLosses, 1)
+int rthWins = array.get(resolvedSessionWins, 2)
+int rthLosses = array.get(resolvedSessionLosses, 2)
+int otherSessionWins = array.get(resolvedSessionWins, 3)
+int otherSessionLosses = array.get(resolvedSessionLosses, 3)
+string asiaWinRateText = f_diag_rate_text(asiaWins, asiaLosses)
+string londonWinRateText = f_diag_rate_text(londonWins, londonLosses)
+string rthWinRateText = f_diag_rate_text(rthWins, rthLosses)
+string otherSessionWinRateText = f_diag_rate_text(otherSessionWins, otherSessionLosses)
+
+// =============================================================================
+// TRADE GEOMETRY
+// =============================================================================
+
+plot(showContextLines ? ema9 : na, "EMA 9", color=color.new(color.maroon, 0), linewidth=1)
+plot(showContextLines ? ema21 : na, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
+plot(showContextLines ? ema50 : na, "EMA 50", color=color.new(color.aqua, 0), linewidth=2)
+plot(showContextLines ? vwap : na, "VWAP", color=color.new(color.white, 0), linewidth=2)
+
+plot(showSessionLevels ? asiaHigh : na, "Asia High", color=color.new(color.blue, 65), style=plot.style_linebr)
+plot(showSessionLevels ? asiaLow : na, "Asia Low", color=color.new(color.blue, 65), style=plot.style_linebr)
+plot(showSessionLevels ? londonHigh : na, "London High", color=color.new(color.purple, 60), style=plot.style_linebr)
+plot(showSessionLevels ? londonLow : na, "London Low", color=color.new(color.purple, 60), style=plot.style_linebr)
+plot(showSessionLevels ? overnightHigh : na, "Overnight High", color=color.new(color.gray, 60), style=plot.style_linebr)
+plot(showSessionLevels ? overnightLow : na, "Overnight Low", color=color.new(color.gray, 60), style=plot.style_linebr)
+plot(showSessionLevels ? or5High : na, "OR5 High", color=color.new(color.yellow, 65), style=plot.style_linebr)
+plot(showSessionLevels ? or5Low : na, "OR5 Low", color=color.new(color.yellow, 65), style=plot.style_linebr)
+plot(showSessionLevels ? or15High : na, "OR15 High", color=color.new(color.orange, 65), style=plot.style_linebr)
+plot(showSessionLevels ? or15Low : na, "OR15 Low", color=color.new(color.orange, 65), style=plot.style_linebr)
+plot(showSessionLevels ? or30High : na, "OR30 High", color=color.new(color.white, 70), style=plot.style_linebr)
+plot(showSessionLevels ? or30Low : na, "OR30 Low", color=color.new(color.white, 70), style=plot.style_linebr)
+
+float plottedEntry = tradeState == 2 ? activeEntry : na
+float plottedRisk = tradeState == 2 ? activeRiskStop : na
+float plottedInvalidation = tradeState == 2 ? activeInvalidation : na
+float plottedTP1 = tradeState == 2 ? activeTP1 : na
+float plottedTP2 = tradeState == 2 ? activeTP2 : na
+float plottedZoneHigh = tradeState > 0 ? activeZoneHigh : na
+float plottedZoneLow = tradeState > 0 ? activeZoneLow : na
+
+plot(plottedEntry, "Entry", color=color.yellow, linewidth=3, style=plot.style_linebr)
+plot(plottedRisk, "Risk Stop", color=color.orange, linewidth=3, style=plot.style_linebr)
+plot(plottedInvalidation, "Invalidation", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(plottedTP1, "TP1", color=color.lime, linewidth=3, style=plot.style_linebr)
+plot(plottedTP2, "TP2", color=color.green, linewidth=3, style=plot.style_linebr)
+zoneTopPlot = plot(plottedZoneHigh, "Entry Zone High", color=color.new(color.yellow, 70), style=plot.style_linebr)
+zoneBottomPlot = plot(plottedZoneLow, "Entry Zone Low", color=color.new(color.yellow, 70), style=plot.style_linebr)
+fill(zoneTopPlot, zoneBottomPlot, color=color.new(color.yellow, 88), title="Entry Zone")
+
+// Direct right-side labels make active levels unmistakable.
+var label entryPriceLabel = na
+var label riskPriceLabel = na
+var label invalidationPriceLabel = na
+var label tp1PriceLabel = na
+var label tp2PriceLabel = na
+var label zonePriceLabel = na
+
+if showPriceLabels and tradeState == 2
+    if na(entryPriceLabel)
+        entryPriceLabel := label.new(bar_index + 2, activeEntry, "ENTRY " + str.tostring(activeEntry, format.mintick), style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.small)
+        riskPriceLabel := label.new(bar_index + 2, activeRiskStop, "RISK STOP " + str.tostring(activeRiskStop, format.mintick), style=label.style_label_left, color=color.orange, textcolor=color.black, size=size.small)
+        invalidationPriceLabel := label.new(bar_index + 2, activeInvalidation, "INVALID " + str.tostring(activeInvalidation, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.small)
+        tp1PriceLabel := label.new(bar_index + 2, activeTP1, "TP1 " + str.tostring(activeTP1, format.mintick), style=label.style_label_left, color=color.lime, textcolor=color.black, size=size.small)
+        tp2PriceLabel := label.new(bar_index + 2, activeTP2, "TP2 " + str.tostring(activeTP2, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.small)
+    else
+        label.set_xy(entryPriceLabel, bar_index + 2, activeEntry)
+        label.set_text(entryPriceLabel, "ENTRY " + str.tostring(activeEntry, format.mintick))
+        label.set_xy(riskPriceLabel, bar_index + 2, activeRiskStop)
+        label.set_text(riskPriceLabel, "RISK STOP " + str.tostring(activeRiskStop, format.mintick))
+        label.set_xy(invalidationPriceLabel, bar_index + 2, activeInvalidation)
+        label.set_text(invalidationPriceLabel, "INVALID " + str.tostring(activeInvalidation, format.mintick))
+        label.set_xy(tp1PriceLabel, bar_index + 2, activeTP1)
+        label.set_text(tp1PriceLabel, "TP1 " + str.tostring(activeTP1, format.mintick))
+        label.set_xy(tp2PriceLabel, bar_index + 2, activeTP2)
+        label.set_text(tp2PriceLabel, "TP2 " + str.tostring(activeTP2, format.mintick))
+else
+    if not na(entryPriceLabel)
+        label.delete(entryPriceLabel)
+        label.delete(riskPriceLabel)
+        label.delete(invalidationPriceLabel)
+        label.delete(tp1PriceLabel)
+        label.delete(tp2PriceLabel)
+        entryPriceLabel := na
+        riskPriceLabel := na
+        invalidationPriceLabel := na
+        tp1PriceLabel := na
+        tp2PriceLabel := na
+
+if showPriceLabels and tradeState == 1
+    float zoneMidLabel = (activeZoneLow + activeZoneHigh) / 2.0
+    if na(zonePriceLabel)
+        zonePriceLabel := label.new(bar_index + 2, zoneMidLabel, "ENTRY ZONE\n" + zoneText, style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.small)
+    else
+        label.set_xy(zonePriceLabel, bar_index + 2, zoneMidLabel)
+        label.set_text(zonePriceLabel, "ENTRY ZONE\n" + zoneText)
+else
+    if not na(zonePriceLabel)
+        label.delete(zonePriceLabel)
+        zonePriceLabel := na
+
+// =============================================================================
+// COMPACT TABLE - actionable information only.
+// =============================================================================
+
+var table info = table.new(position.top_right, 2, 27, bgcolor=color.new(color.black, 12), border_width=1)
+
+if barstate.islast and showTable
+    table.cell(info, 0, 0, "TRADE", text_color=color.white)
+    table.cell(info, 1, 0, syminfo.ticker, text_color=color.white)
+    table.cell(info, 0, 1, "Direction", text_color=color.white)
+    table.cell(info, 1, 1, directionText, text_color=directionText == "LONG" ? color.lime : directionText == "SHORT" ? color.red : color.white)
+    table.cell(info, 0, 2, "Probability", text_color=color.white)
+    table.cell(info, 1, 2, probabilityText, text_color=tradeState > 0 ? color.lime : color.white)
+    table.cell(info, 0, 3, "State", text_color=color.white)
+    table.cell(info, 1, 3, stateText, text_color=stateText == "ACTIVE" ? color.lime : stateText == "WAIT PULLBACK" ? color.yellow : color.white)
+    table.cell(info, 0, 4, "Entry", text_color=color.white)
+    table.cell(info, 1, 4, entryText, text_color=color.yellow)
+    table.cell(info, 0, 5, "Entry Zone", text_color=color.white)
+    table.cell(info, 1, 5, zoneText, text_color=color.yellow)
+    table.cell(info, 0, 6, "Risk Stop", text_color=color.white)
+    table.cell(info, 1, 6, riskText, text_color=color.orange)
+    table.cell(info, 0, 7, "Invalidation", text_color=color.white)
+    table.cell(info, 1, 7, invalidationText, text_color=color.red)
+    table.cell(info, 0, 8, "TP1", text_color=color.white)
+    table.cell(info, 1, 8, tp1Text, text_color=color.lime)
+    table.cell(info, 0, 9, "TP2", text_color=color.white)
+    table.cell(info, 1, 9, tp2Text, text_color=color.green)
+    table.cell(info, 0, 10, "Trade Health", text_color=color.white)
+    table.cell(info, 1, 10, healthText, text_color=tradeState == 2 and activeFailureCount >= 3 ? color.orange : tradeState == 2 and activeHealth < healthWarningLevel ? color.yellow : tradeState == 2 ? color.lime : color.white)
+    table.cell(info, 0, 11, "AMD Phase", text_color=color.white)
+    table.cell(info, 1, 11, amdPhaseText, text_color=amdPhaseColor)
+    table.cell(info, 0, 12, "MES Context", text_color=color.white)
+    table.cell(info, 1, 12, esContextText, text_color=esContextColor)
+    table.cell(info, 0, 13, "M2K Context", text_color=color.white)
+    table.cell(info, 1, 13, rtyContextText, text_color=rtyContextColor)
+    table.cell(info, 0, 14, "Intermarket", text_color=color.white)
+    table.cell(info, 1, 14, intermarketText, text_color=intermarketColor)
+    table.cell(info, 0, 15, "X-Mkt Prob Adj", text_color=color.white)
+    table.cell(info, 1, 15, intermarketBiasText, text_color=intermarketBiasColor)
+    table.cell(info, 0, 16, "MICRO SCANNER", text_color=color.aqua)
+    table.cell(info, 1, 16, showMicroScanner ? "4 SETUPS / 6 MARKETS" : "OFF", text_color=showMicroScanner ? color.aqua : color.white)
+    table.cell(info, 0, 17, "MNQ", text_color=color.white)
+    table.cell(info, 1, 17, showMicroScanner ? mnqScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(mnqScanDirection, mnqScanStatus) : color.white)
+    table.cell(info, 0, 18, "MES", text_color=color.white)
+    table.cell(info, 1, 18, showMicroScanner ? mesScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(mesScanDirection, mesScanStatus) : color.white)
+    table.cell(info, 0, 19, "M2K", text_color=color.white)
+    table.cell(info, 1, 19, showMicroScanner ? m2kScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(m2kScanDirection, m2kScanStatus) : color.white)
+    table.cell(info, 0, 20, "MYM", text_color=color.white)
+    table.cell(info, 1, 20, showMicroScanner ? mymScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(mymScanDirection, mymScanStatus) : color.white)
+    table.cell(info, 0, 21, "MGC", text_color=color.white)
+    table.cell(info, 1, 21, showMicroScanner ? mgcScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(mgcScanDirection, mgcScanStatus) : color.white)
+    table.cell(info, 0, 22, "MCL", text_color=color.white)
+    table.cell(info, 1, 22, showMicroScanner ? mclScannerText : "--", text_color=showMicroScanner ? f_scan_row_color(mclScanDirection, mclScanStatus) : color.white)
+    table.cell(info, 0, 23, "Scanner Alert", text_color=color.white)
+    table.cell(info, 1, 23, showMicroScanner ? scannerAlertText : "--", text_color=showMicroScanner ? scannerAlertColor : color.white)
+    table.cell(info, 0, 24, "Trade Record", text_color=color.white)
+    table.cell(info, 1, 24, resolvedRecordText, text_color=resolvedTrades > 0 ? color.aqua : color.white)
+    table.cell(info, 0, 25, "Win Rate", text_color=color.white)
+    table.cell(info, 1, 25, resolvedWinRateText, text_color=resolvedWinRateColor)
+    table.cell(info, 0, 26, "Trade History", text_color=color.white)
+    table.cell(info, 1, 26, "TV TESTER ON | TP1 = WIN", text_color=color.aqua)
+
+// Hidden diagnostics for testing without table clutter.
+// Trimmed in v2.4.4a to stay safely below TradingView's 64-plot limit.
+// Resolved performance metrics remain available in the Data Window / Strategy Tester.
+plot(longProbability, "Long Probability", display=display.data_window)
+plot(shortProbability, "Short Probability", display=display.data_window)
+plot(currentProbabilityThreshold, "Current Probability Threshold", display=display.data_window)
+plot(deltaPct, "Estimated Delta %", display=display.data_window)
+plot(effectiveRVOL, "Time-Adjusted RVOL", display=display.data_window)
+plot(atrRank, "ATR Percentile Rank", display=display.data_window)
+plot(volatilityRegime, "Volatility Regime 0-3", display=display.data_window)
+plot(longPillars, "Long Pillars", display=display.data_window)
+plot(shortPillars, "Short Pillars", display=display.data_window)
+plot(tradeState == 2 ? activeFamily : na, "Active Setup Family 1-4", display=display.data_window)
+plot(intermarketNetAdjustment, "Intermarket Net Probability Adjustment", display=display.data_window)
+plot(resolvedTrades, "Resolved Trade Count", display=display.data_window)
+plot(resolvedWinRate, "Resolved Trade Win Rate %", display=display.data_window)
+plot(pullbackWinRate, "Pullback Family Win Rate %", display=display.data_window)
+plot(breakoutWinRate, "Breakout Family Win Rate %", display=display.data_window)
+plot(sweepWinRate, "Sweep Family Win Rate %", display=display.data_window)
+plot(failedBreakWinRate, "Failed Break Family Win Rate %", display=display.data_window)
+plot(resolvedLongWins + resolvedLongLosses > 0 ? resolvedLongWins * 100.0 / (resolvedLongWins + resolvedLongLosses) : na, "LONG Resolved Win Rate %", display=display.data_window)
+plot(resolvedShortWins + resolvedShortLosses > 0 ? resolvedShortWins * 100.0 / (resolvedShortWins + resolvedShortLosses) : na, "SHORT Resolved Win Rate %", display=display.data_window)
+plot(asiaWins + asiaLosses > 0 ? asiaWins * 100.0 / (asiaWins + asiaLosses) : na, "Asia Entry Session Win Rate %", display=display.data_window)
+plot(londonWins + londonLosses > 0 ? londonWins * 100.0 / (londonWins + londonLosses) : na, "London Entry Session Win Rate %", display=display.data_window)
+plot(rthWins + rthLosses > 0 ? rthWins * 100.0 / (rthWins + rthLosses) : na, "RTH Entry Session Win Rate %", display=display.data_window)
+plot(otherSessionWins + otherSessionLosses > 0 ? otherSessionWins * 100.0 / (otherSessionWins + otherSessionLosses) : na, "Other Entry Session Win Rate %", display=display.data_window)

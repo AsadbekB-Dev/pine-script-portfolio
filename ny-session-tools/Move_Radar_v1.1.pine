@@ -1,0 +1,253 @@
+//@version=6
+indicator("ASADS Move Radar v1.1", shorttitle="MOVE RADAR", overlay=true, max_lines_count=50, max_labels_count=500, max_boxes_count=50)
+// ============================================================================
+// ASADS MOVE RADAR v1.1
+//
+// Tells you WHEN a big move is likely and HOW BIG — not which side.
+// Research (1y MNQ, tested on unseen months): the size/timing of the next move
+// is very predictable (AUC ~0.88, driven by volatility + time of day); the
+// side is a coin flip (AUC ~0.47). So: the radar does timing + size, YOU call
+// the side. Live flow (pushes inside the candle, delta, volume pace) helps you
+// read the side in real time.
+//
+// 1) EXPECTED SIZE  each 5m slot of the day learns its normal candle range;
+//    multiplied by how volatile TODAY is vs normal for the same times.
+//    Drawn as a box: how far price can typically go in the next 15 min.
+// 2) BIG-MOVE %     chance price travels X pts (either way) within 1/2/3 candles.
+//    Self-calibrating: every bar's prediction is scored once its outcome is
+//    known (walk-forward, no future peeking) and the % shown is the real hit
+//    rate of past predictions in the same bucket.
+// 3) FLAGS          "BIG MOVE COMING" / "DEAD ZONE" tags on the candle where the
+//    alert fires, plus a result tag 15 min later (✓/✗, side, points travelled)
+//    and a running record in the panel — so you can check how it did on past days.
+// 4) LIVE FLOW      realtime only: push sequence inside the forming candle
+//    (ticks per push), tick-rule delta, volume pace vs normal for this slot.
+// ============================================================================
+const string TZ = "America/Los_Angeles"
+
+const string G_M = "Move"
+float moveX = input.float(40.0, "Big move size (points)", minval=1, group=G_M)
+string sessWin = input.session("0630-1315", "Session to learn + show (Pacific)", group=G_M)
+int slotDays = input.int(20, "Time-of-day memory (days)", minval=2, group=G_M)
+int minSamples = input.int(30, "Min samples before showing a %", minval=5, group=G_M)
+
+const string G_A = "Alerts / flags"
+float hotPct = input.float(80.0, "BIG MOVE COMING when 15-min % ≥", minval=1, maxval=100, group=G_A)
+float deadPct = input.float(35.0, "DEAD ZONE when 15-min % ≤", minval=0, maxval=100, group=G_A)
+bool showMarks = input.bool(true, "Show BIG MOVE COMING tags + results", group=G_A)
+bool showDead = input.bool(true, "Show DEAD ZONE tags + results", group=G_A)
+
+const string G_F = "Live flow"
+int revTicks = input.int(4, "Ticks against a push to call it finished", minval=1, group=G_F)
+int keepPushes = input.int(6, "Pushes to show", minval=2, maxval=12, group=G_F)
+
+const string G_V = "Visuals"
+bool showBox = input.bool(true, "Show expected 15-min range box", group=G_V)
+string panelPosIn = input.string("Bottom right", "Panel position", options=["Top right", "Middle right", "Bottom right", "Top center", "Bottom center", "Bottom left", "Middle left"], group=G_V)
+
+// ---------------------------------------------------------------- time
+bool inWin = not na(time(timeframe.period, sessWin, TZ))
+int slotKey = hour(time, TZ) * 60 + minute(time, TZ)
+int tfMin = math.max(1, int(timeframe.in_seconds() / 60))
+int nextKey = (slotKey + tfMin) % 1440
+
+// ---------------------------------------------------------------- 1) expected size
+var map<int, float> slotRng = map.new<int, float>()
+var map<int, float> slotVol = map.new<int, float>()
+var map<int, int> slotN = map.new<int, int>()
+float rng = high - low
+float atr = ta.atr(14)
+float prevR = slotRng.contains(slotKey) ? slotRng.get(slotKey) : na
+float prevV = slotVol.contains(slotKey) ? slotVol.get(slotKey) : na
+int prevN = slotN.contains(slotKey) ? slotN.get(slotKey) : 0
+bool slotReady = prevN >= 5 and prevR > 0
+float rr = slotReady ? rng / prevR : na
+float todayMult = ta.ema(nz(rr, 1.0), 12)
+if barstate.isconfirmed
+    float a = 2.0 / (slotDays + 1)
+    slotRng.put(slotKey, na(prevR) ? rng : prevR + a * (rng - prevR))
+    slotVol.put(slotKey, na(prevV) ? volume : prevV + a * (volume - prevV))
+    slotN.put(slotKey, prevN + 1)
+float nextSlotR = slotRng.contains(nextKey) and slotN.get(nextKey) >= 5 ? slotRng.get(nextKey) : na
+float expR1 = na(nextSlotR) ? atr : nextSlotR * todayMult
+float expT1 = expR1
+float expT2 = expR1 * math.sqrt(2)
+float expT3 = expR1 * math.sqrt(3)
+
+// ---------------------------------------------------------------- 2) big-move % (walk-forward calibration)
+const int NB = 14
+f_bin(float travel) => na(travel) ? -1 : math.min(NB - 1, int(math.floor(travel / moveX / 0.2)))
+int b1 = f_bin(expT1)
+int b2 = f_bin(expT2)
+int b3 = f_bin(expT3)
+var array<int> c1 = array.new<int>(NB, 0)
+var array<int> h1 = array.new<int>(NB, 0)
+var array<int> c2 = array.new<int>(NB, 0)
+var array<int> h2 = array.new<int>(NB, 0)
+var array<int> c3 = array.new<int>(NB, 0)
+var array<int> h3 = array.new<int>(NB, 0)
+float upTr1 = ta.highest(high, 1) - close[1]
+float dnTr1 = close[1] - ta.lowest(low, 1)
+float upTr2 = ta.highest(high, 2) - close[2]
+float dnTr2 = close[2] - ta.lowest(low, 2)
+float upTr3 = ta.highest(high, 3) - close[3]
+float dnTr3 = close[3] - ta.lowest(low, 3)
+bool hit1 = upTr1 >= moveX or dnTr1 >= moveX
+bool hit2 = upTr2 >= moveX or dnTr2 >= moveX
+bool hit3 = upTr3 >= moveX or dnTr3 >= moveX
+if barstate.isconfirmed
+    if inWin[1] and b1[1] >= 0
+        c1.set(b1[1], c1.get(b1[1]) + 1)
+        h1.set(b1[1], h1.get(b1[1]) + (hit1 ? 1 : 0))
+    if inWin[2] and b2[2] >= 0
+        c2.set(b2[2], c2.get(b2[2]) + 1)
+        h2.set(b2[2], h2.get(b2[2]) + (hit2 ? 1 : 0))
+    if inWin[3] and b3[3] >= 0
+        c3.set(b3[3], c3.get(b3[3]) + 1)
+        h3.set(b3[3], h3.get(b3[3]) + (hit3 ? 1 : 0))
+f_pct(array<int> c, array<int> h, int b) => b < 0 or c.get(b) < minSamples ? na : 100.0 * h.get(b) / c.get(b)
+float p1 = f_pct(c1, h1, b1)
+float p2 = f_pct(c2, h2, b2)
+float p3 = f_pct(c3, h3, b3)
+int nCal = int(c3.sum())
+
+bool hotNow = inWin and not na(p3) and p3 >= hotPct
+bool deadNow = inWin and not na(p3) and p3 <= deadPct
+string state = na(p3) ? "LEARNING (" + str.tostring(nCal) + " samples)" : p3 >= hotPct ? "BIG MOVE COMING" : p3 <= deadPct ? "DEAD ZONE — small moves expected" : "NORMAL"
+color stateCol = na(p3) ? color.gray : p3 >= hotPct ? color.orange : p3 <= deadPct ? color.new(color.blue, 20) : color.new(color.gray, 30)
+
+// ---------------------------------------------------------------- 3) flags on the chart + results + record
+bool hotFlip = barstate.isconfirmed and hotNow and not hotNow[1]
+bool deadFlip = barstate.isconfirmed and deadNow and not deadNow[1]
+if hotFlip
+    alert("MOVE RADAR: BIG MOVE COMING — " + str.tostring(p3, "#") + "% chance of " + str.tostring(moveX, "#") + " pts within 15 min · expected ±" + str.tostring(expT3, "#") + " pts. Side is your call.", alert.freq_once_per_bar_close)
+    if showMarks
+        label.new(bar_index, high, "BIG MOVE\nCOMING\n" + str.tostring(p3, "#") + "% · ±" + str.tostring(expT3, "#"), style=label.style_label_down, color=color.new(color.orange, 5), textcolor=color.black, size=size.small, tooltip="Chance of a " + str.tostring(moveX, "#") + "-pt move (either side) within 15 min: " + str.tostring(p3, "#") + "%\nExpected 15-min travel: ±" + str.tostring(expT3, "#") + " pts\nToday vs normal: " + str.tostring(todayMult, "#.##") + "x")
+if deadFlip
+    alert("MOVE RADAR: DEAD ZONE — small moves expected (" + str.tostring(p3, "#") + "% for " + str.tostring(moveX, "#") + " pts in 15 min).", alert.freq_once_per_bar_close)
+    if showMarks and showDead
+        label.new(bar_index, high, "DEAD ZONE", style=label.style_label_down, color=color.new(color.blue, 15), textcolor=color.white, size=size.tiny, tooltip="Only " + str.tostring(p3, "#") + "% chance of a " + str.tostring(moveX, "#") + "-pt move in 15 min. Expected travel ±" + str.tostring(expT3, "#") + " pts.")
+
+var int hotN = 0
+var int hotHit = 0
+var int deadN = 0
+var int deadQuiet = 0
+if barstate.isconfirmed and hotFlip[3]
+    bool ok = hit3
+    hotN += 1
+    hotHit += ok ? 1 : 0
+    if showMarks
+        string side = upTr3 >= moveX and dnTr3 >= moveX ? "↑↓" : upTr3 >= moveX ? "↑" : dnTr3 >= moveX ? "↓" : ""
+        string txt = ok ? "✓ " + side + " " + str.tostring(math.max(upTr3, dnTr3), "#") : "✗ " + str.tostring(math.max(upTr3, dnTr3), "#")
+        label.new(bar_index - 3, low[3], txt, style=label.style_label_up, color=color.new(ok ? color.green : color.red, 20), textcolor=color.white, size=size.tiny, tooltip="BIG MOVE result — max travel in 15 min: ↑" + str.tostring(upTr3, "#") + " / ↓" + str.tostring(dnTr3, "#") + " pts")
+if barstate.isconfirmed and deadFlip[3]
+    bool quiet = not hit3
+    deadN += 1
+    deadQuiet += quiet ? 1 : 0
+    if showMarks and showDead
+        label.new(bar_index - 3, low[3], quiet ? "quiet ✓" : "moved ✗", style=label.style_label_up, color=color.new(quiet ? color.blue : color.red, 30), textcolor=color.white, size=size.tiny, tooltip="DEAD ZONE result — max travel in 15 min: ↑" + str.tostring(upTr3, "#") + " / ↓" + str.tostring(dnTr3, "#") + " pts")
+
+// ---------------------------------------------------------------- 4) live flow (realtime ticks)
+varip int lfBar = -1
+varip float lfLastPx = na
+varip float lfLastVol = 0.0
+varip float lfDelta = 0.0
+varip int lfDir = 0
+varip float lfStart = na
+varip float lfExt = na
+varip string lfSeq = ""
+float tick = syminfo.mintick
+f_tk(float x) => str.tostring(math.round(math.abs(x) / syminfo.mintick))
+if barstate.isrealtime
+    if lfBar != bar_index
+        lfBar := bar_index
+        lfLastPx := open
+        lfLastVol := 0.0
+        lfDelta := 0.0
+        lfDir := 0
+        lfStart := open
+        lfExt := open
+        lfSeq := ""
+    float dv = volume - lfLastVol
+    if close > lfLastPx
+        lfDelta += dv
+    else if close < lfLastPx
+        lfDelta -= dv
+    lfLastVol := volume
+    lfLastPx := close
+    float rev = revTicks * tick
+    if lfDir == 0
+        if close - lfStart >= rev
+            lfDir := 1
+            lfExt := close
+        else if lfStart - close >= rev
+            lfDir := -1
+            lfExt := close
+    else if lfDir == 1
+        if close > lfExt
+            lfExt := close
+        else if lfExt - close >= rev
+            lfSeq := lfSeq + "▲" + f_tk(lfExt - lfStart) + " "
+            lfStart := lfExt
+            lfDir := -1
+            lfExt := close
+    else
+        if close < lfExt
+            lfExt := close
+        else if close - lfExt >= rev
+            lfSeq := lfSeq + "▼" + f_tk(lfStart - lfExt) + " "
+            lfStart := lfExt
+            lfDir := 1
+            lfExt := close
+
+string pushTxt = "live only (needs a realtime candle)"
+string deltaTxt = "—"
+if barstate.isrealtime
+    array<string> parts = str.split(str.trim(lfSeq), " ")
+    string shown = ""
+    int startI = math.max(0, parts.size() - keepPushes)
+    if parts.size() > 0
+        for i = startI to parts.size() - 1
+            if parts.get(i) != ""
+                shown += parts.get(i) + " "
+    string nowTxt = lfDir == 1 ? "now ▲" + f_tk(lfExt - lfStart) : lfDir == -1 ? "now ▼" + f_tk(lfStart - lfExt) : "now ·"
+    pushTxt := (shown == "" ? "" : shown + "→ ") + nowTxt + " (ticks)"
+    float elapsed = math.max(0.05, math.min(1.0, (timenow - time) / (timeframe.in_seconds() * 1000.0)))
+    float pace = not na(prevV) and prevV > 0 ? volume / (prevV * elapsed) : na
+    float loc = high > low ? (close - low) / (high - low) : 0.5
+    string absTxt = lfDelta < -0.15 * volume and loc >= 0.6 ? " · sellers being ABSORBED" : lfDelta > 0.15 * volume and loc <= 0.4 ? " · buyers being ABSORBED" : ""
+    deltaTxt := (lfDelta >= 0 ? "+" : "") + str.tostring(lfDelta, "#") + (lfDelta > 0.1 * volume ? " buyers" : lfDelta < -0.1 * volume ? " sellers" : " even") + " · volume pace " + (na(pace) ? "—" : str.tostring(pace, "#.#") + "x") + absTxt
+
+// ---------------------------------------------------------------- expected-range box (next 15 min)
+var box rangeBox = na
+if barstate.islast and showBox and not na(expT3)
+    box.delete(rangeBox)
+    color bc = hotNow ? color.orange : deadNow ? color.blue : color.gray
+    rangeBox := box.new(bar_index, close + expT3, bar_index + 3, close - expT3, border_color=color.new(bc, 30), border_style=line.style_dashed, bgcolor=color.new(bc, 88), text="next 15m ≈ ±" + str.tostring(expT3, "#") + " pts" + (na(p3) ? "" : "\n" + str.tostring(moveX, "#") + "-pt move: " + str.tostring(p3, "#") + "%"), text_color=color.new(bc, 0), text_size=size.small, text_valign=text.align_top)
+
+// ---------------------------------------------------------------- panel
+string panelPos = panelPosIn == "Top right" ? position.top_right : panelPosIn == "Middle right" ? position.middle_right : panelPosIn == "Bottom right" ? position.bottom_right : panelPosIn == "Top center" ? position.top_center : panelPosIn == "Bottom center" ? position.bottom_center : panelPosIn == "Middle left" ? position.middle_left : position.bottom_left
+var table tb = table.new(panelPos, 2, 9, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 70))
+f_p(float p) => na(p) ? "—" : str.tostring(p, "#") + "%"
+if barstate.islast
+    table.cell(tb, 0, 0, "MOVE RADAR", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, inWin ? state : "outside session", bgcolor=inWin ? stateCol : color.new(color.gray, 60), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 1, str.tostring(moveX, "#") + " pts move", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 1, "5m " + f_p(p1) + " · 10m " + f_p(p2) + " · 15m " + f_p(p3), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 2, "Next candle", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 2, "≈ " + str.tostring(expR1, "#") + " pts range · 15m ≈ ±" + str.tostring(expT3, "#"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 3, "Today vs normal", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 3, str.tostring(todayMult, "#.##") + "x " + (todayMult >= 1.3 ? "(hot day)" : todayMult <= 0.8 ? "(quiet day)" : "(normal)"), text_color=todayMult >= 1.3 ? color.orange : color.white, text_size=size.small)
+    table.cell(tb, 0, 4, "Pushes", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 4, pushTxt, text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 5, "Live delta", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 5, deltaTxt, text_color=lfDelta > 0 ? color.lime : lfDelta < 0 ? color.red : color.white, text_size=size.small)
+    table.cell(tb, 0, 6, "Flag record", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 6, "BIG MOVE " + str.tostring(hotHit) + "/" + str.tostring(hotN) + (hotN > 0 ? " hit (" + str.tostring(100.0 * hotHit / hotN, "#") + "%)" : "") + " · DEAD " + str.tostring(deadQuiet) + "/" + str.tostring(deadN) + (deadN > 0 ? " quiet (" + str.tostring(100.0 * deadQuiet / deadN, "#") + "%)" : ""), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 7, "Side", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 7, "your call — size/timing is predictable, direction isn't", text_color=color.gray, text_size=size.tiny)
+    table.cell(tb, 0, 8, "Calibration", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 8, str.tostring(nCal) + " scored predictions (15m)", text_color=color.gray, text_size=size.tiny)
+
+plot(p3, "Big-move % (15m)", display=display.data_window)
+plot(expR1, "Expected next-candle range", display=display.data_window)

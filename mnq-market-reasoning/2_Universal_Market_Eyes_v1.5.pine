@@ -1,0 +1,1945 @@
+//@version=6
+indicator("Asads — Universal Market Eyes v1.5 CROSS-MARKET SEMANTIC FIX", overlay=true, max_boxes_count=40, max_labels_count=20)
+
+// ============================================================================
+// ASADS UNIVERSAL MARKET EYES
+// v1.5 CROSS-MARKET SEMANTIC FIX — v1.4 preserved + mutually-exclusive BUS23 lead/lag facts
+//
+// COMPATIBILITY CONTRACT
+// • BUS 1–11 preserve Bot1 v0.6.1 packing and semantics.
+// • BUS 12–15 preserve Option1 QQQ Market Eyes v2.0 footprint/value/VWAP semantics.
+// • BUS 16–19 are additive research telemetry only; they do NOT change BUS 1–15 behavior.
+// • BUS 20 is additive cross-market detail. BUS 1–19 remain bit-for-bit semantic-compatible.
+// • BUS 21 is additive multi-horizon factual context from the last COMPLETED setup/macro bars.
+// • BUS 22 adds row-location footprint facts (upper/lower imbalance, poor-impact, acceptance).
+// • BUS 23 adds one-bar NQ/benchmark lead-lag plus RTH displacement/location/late-session phase.
+// • The EYES NEVER vote LONG/SHORT or CALL/PUT. Downstream brains interpret facts.
+// • BUS21 exposes normalized displacement, directional efficiency and range location only; it does not label trade direction.
+// • BUS22/23 remain factual. They do not vote LONG/SHORT and preserve BUS1–21 semantics.
+// • AUTO profile specializes session windows and cross-market benchmark by instrument type.
+// • Existing zone geometry remains LEGACY-COMPAT by default. Scaling changes belong in A/B research.
+//
+// DESIGN RULES
+// 1) Bot1 maps facts/decision zones. It NEVER votes LONG or SHORT.
+// 2) All structure becomes available only when it is knowable.
+// 3) Nearby references are clustered into ONE zone.
+// 4) The active registry is bounded. Old/consumed/noisy zones are retired.
+// 5) Native footprint is OBSERVATION only: delta, POC/value migration,
+//    imbalances and absorption-like effort/result facts. Interpretation belongs
+//    downstream.
+// 6) Drawings are visualization only. Bot2/Option2 consume hidden BUS plots.
+// 7) Historical logic runs sequentially; future data is never used to create a
+//    fact before its confirmation time.
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+string G_PROFILE = "0. Universal Profile"
+string marketProfile = input.string("AUTO", "Market profile", options=["AUTO", "FUTURES", "EQUITY / ETF"], group=G_PROFILE,
+     tooltip="AUTO uses syminfo.type. Futures use CME-style extended-session windows + ES benchmark; equities/ETFs use after-hours/premarket + SPY benchmark.")
+bool profileIsFutures = marketProfile == "FUTURES" or (marketProfile == "AUTO" and syminfo.type == "futures")
+string profileText = profileIsFutures ? "FUTURES" : "EQUITY / ETF"
+
+string G_CORE = "1. Core"
+string setupTf = input.timeframe("15", "Structure TF", group=G_CORE)
+string macroTf = input.timeframe("240", "Macro TF", group=G_CORE)
+int swingLen5 = input.int(2, "5m pivot length", 1, 6, group=G_CORE)
+int swingLenSetup = input.int(2, "Structure pivot length", 1, 6, group=G_CORE)
+int swingLenMacro = input.int(2, "Macro pivot length", 1, 6, group=G_CORE)
+int atrLen = input.int(14, "ATR length", 5, 50, group=G_CORE)
+bool use5mReactionPivots = input.bool(true, "Use meaningful 5m reaction pivots", group=G_CORE)
+bool usePriorDayWeek = input.bool(true, "Use prior day/week extremes", group=G_CORE)
+bool useSessions = input.bool(true, "Use completed session extremes", group=G_CORE)
+
+string G_ZONE = "2. Zone Engine"
+int maxZones = input.int(36, "Maximum active registry zones", 16, 60, group=G_ZONE)
+float clusterAtrFrac = input.float(0.12, "Cluster radius · ATR", 0.03, 0.35, step=0.01, group=G_ZONE)
+float clusterMinPts = input.float(1.75, "Minimum cluster radius (points)", 0.50, 8.0, step=0.25, group=G_ZONE)
+float clusterMaxPts = input.float(6.00, "Maximum cluster radius (points)", 2.0, 20.0, step=0.25, group=G_ZONE)
+float zoneHalfAtrFrac = input.float(0.055, "Base zone half-width · ATR", 0.015, 0.15, step=0.005, group=G_ZONE)
+float zoneHalfMinPts = input.float(0.75, "Minimum half-width (points)", 0.25, 4.0, step=0.25, group=G_ZONE)
+float zoneHalfMaxPts = input.float(3.50, "Maximum half-width (points)", 1.0, 10.0, step=0.25, group=G_ZONE)
+float maxClusterWidthAtr = input.float(0.30, "Maximum merged width · ATR", 0.10, 0.70, step=0.01, group=G_ZONE)
+float maxClusterWidthPts = input.float(10.0, "Absolute maximum merged width", 3.0, 30.0, step=0.5, group=G_ZONE)
+
+string G_LIFE = "3. Zone Lifecycle"
+float interactionAtr = input.float(0.08, "Interaction buffer · ATR", 0.02, 0.25, step=0.01, group=G_LIFE)
+float acceptanceAtr = input.float(0.10, "Acceptance buffer · ATR", 0.03, 0.30, step=0.01, group=G_LIFE)
+int acceptCloses = input.int(2, "Closes required for acceptance", 1, 4, group=G_LIFE)
+int separateTouchBars = input.int(3, "Bars between separate touches", 1, 12, group=G_LIFE)
+int maxCrossesBeforeConsumed = input.int(5, "Crosses before zone is consumed", 2, 10, group=G_LIFE)
+int staleBars = input.int(2016, "Weak-zone stale age (5m bars)", 288, 8000, group=G_LIFE,
+     tooltip="2016 bars ≈ 7 calendar days on a 24h 5m chart.")
+float pruneDistanceAtr = input.float(35.0, "Weak-zone prune distance · ATR", 10, 100, step=1, group=G_LIFE)
+
+string G_MICRO = "4. Noise Control"
+float min5mReactionAtr = input.float(0.65, "Minimum 5m pivot reaction · ATR", 0.25, 2.0, step=0.05, group=G_MICRO)
+int minVisibleStrength = input.int(5, "Minimum displayed significance", 3, 10, group=G_MICRO)
+int maxVisibleZones = input.int(8, "Maximum visible zones", 4, 12, group=G_MICRO)
+float visibleRadiusAtr = input.float(14.0, "Visible relevance radius · ATR", 4, 40, step=1, group=G_MICRO)
+
+string G_BAL = "5. Auction Balance"
+int balanceLookback = input.int(18, "Balance observation bars", 10, 36, group=G_BAL)
+int balanceConfirmBars = input.int(3, "Bars required to establish balance", 2, 6, group=G_BAL)
+float balanceMaxRangeAtr = input.float(2.40, "Maximum balance width · ATR", 1.2, 4.0, step=0.10, group=G_BAL)
+float balanceMaxEfficiency = input.float(0.34, "Maximum directional efficiency", 0.15, 0.60, step=0.01, group=G_BAL)
+float balanceMinOverlap = input.float(0.38, "Minimum average bar overlap", 0.15, 0.70, step=0.01, group=G_BAL)
+float balanceMinCenterTime = input.float(0.50, "Minimum closes in central 60%", 0.30, 0.80, step=0.05, group=G_BAL)
+float balanceEscapeAtr = input.float(0.10, "Escape / acceptance buffer · ATR", 0.03, 0.30, step=0.01, group=G_BAL)
+int balanceAcceptBars = input.int(2, "Closes outside for acceptance", 1, 4, group=G_BAL)
+int chopConfirmBars = input.int(2, "Rotation / chop confirmation bars", 1, 5, group=G_BAL)
+float chopMaxEfficiency = input.float(0.28, "Rotation max directional efficiency", 0.10, 0.50, step=0.01, group=G_BAL)
+float chopMinOverlap = input.float(0.34, "Rotation minimum bar overlap", 0.15, 0.70, step=0.01, group=G_BAL)
+float chopMinFlipRate = input.float(0.34, "Rotation minimum direction-flip rate", 0.15, 0.70, step=0.01, group=G_BAL)
+float chopMaxRangeAtr = input.float(4.0, "Rotation maximum width · ATR", 2.0, 8.0, step=0.25, group=G_BAL)
+
+string G_SESS = "6. Universal Sessions"
+string nyTz = input.string("America/New_York", "Session timezone", group=G_SESS)
+string futuresSessionA = input.session("1800-0000:1234567", "Futures · Asia window", group=G_SESS)
+string futuresSessionB = input.session("0200-0500:1234567", "Futures · London window", group=G_SESS)
+string equitySessionA = input.session("1600-2000:1234567", "Equity · After-hours window", group=G_SESS)
+string equitySessionB = input.session("0400-0930:1234567", "Equity · Premarket window", group=G_SESS)
+string rthSession = input.session("0930-1600:1234567", "New York cash", group=G_SESS)
+string futuresOvernightContext = input.session("1800-0930:1234567", "Futures · Overnight context", group=G_SESS)
+string equityExtendedContext = input.session("1600-0930:1234567", "Equity · Extended-hours context", group=G_SESS)
+
+// Internal generic aliases keep the frozen battlefield machinery identical.
+string asiaSession = profileIsFutures ? futuresSessionA : equitySessionA
+string londonSession = profileIsFutures ? futuresSessionB : equitySessionB
+string overnightContextSession = profileIsFutures ? futuresOvernightContext : equityExtendedContext
+
+string G_CTX = "7. Context Research"
+bool useContextSensors = input.bool(true, "Enable context sensors", group=G_CTX,
+     tooltip="Research-only factual context. Does not vote LONG/SHORT. Detects abnormal repricing-like behavior and remembers response quality at mapped zones.")
+int shockVolLen = input.int(50, "Shock volume baseline", 20, 120, group=G_CTX)
+float shockMinDispAtr = input.float(1.25, "Shock minimum 3-bar displacement · ATR", 0.75, 2.50, step=0.05, group=G_CTX)
+float shockMinEfficiency = input.float(0.55, "Shock minimum 3-bar directional efficiency", 0.35, 0.85, step=0.05, group=G_CTX)
+float shockMinRelVol = input.float(1.60, "Shock minimum 3-bar relative volume", 1.10, 3.50, step=0.10, group=G_CTX)
+int shockMinZoneCrosses = input.int(2, "Shock meaningful zones crossed", 1, 5, group=G_CTX)
+float reactionTrendBand = input.float(0.20, "Reaction trend neutral band", 0.05, 0.50, step=0.05, group=G_CTX,
+     tooltip="Compares the latest completed rejection response with the previous one at the same mapped zone. 0.20 means ±20% is broadly stable.")
+int clockBaselineWeeks = input.int(12, "Same-weekday / same-time baseline weeks", 4, 52, group=G_CTX,
+     tooltip="EMA memory for what volume, true range and bar efficiency normally look like at the SAME 5-minute RTH slot on the SAME weekday. Telemetry only.")
+int clockMinSamples = input.int(4, "Minimum clock samples before trusted", 2, 12, group=G_CTX)
+bool useCrossMarketContext = input.bool(true, "Enable benchmark / VIX context", group=G_CTX,
+     tooltip="Research-only cross-market context. Never votes direction.")
+string futuresBenchmarkSymbol = input.symbol("CME_MINI:ES1!", "Futures benchmark (ES)", group=G_CTX)
+string equityBenchmarkSymbol = input.symbol("AMEX:SPY", "Equity / ETF benchmark (SPY)", group=G_CTX)
+string benchmarkContextSymbol = profileIsFutures ? futuresBenchmarkSymbol : equityBenchmarkSymbol
+string vixContextSymbol = input.symbol("CBOE:VIX", "VIX context symbol", group=G_CTX)
+float crossMoveAtr = input.float(0.20, "Cross-market meaningful 3-bar move · ATR", 0.05, 0.75, step=0.05, group=G_CTX)
+
+string G_FLOW = "8. Footprint / Fair-Value Eyes"
+bool useFootprint = input.bool(true, "Enable native footprint observations", group=G_FLOW,
+     tooltip="Exactly one request.footprint() call. Eyes exports facts only; the downstream brain decides what they mean.")
+int fpTicksPerRow = input.int(10, "Footprint ticks per row", 1, 200, group=G_FLOW)
+float fpValueAreaPct = input.float(70.0, "Footprint value area %", 50.0, 95.0, step=5.0, group=G_FLOW)
+float fpImbalancePct = input.float(300.0, "Footprint imbalance %", 150.0, 600.0, step=25.0, group=G_FLOW)
+float fpStrongDeltaPct = input.float(0.10, "Observation: strong delta fraction", 0.03, 0.40, step=0.01, group=G_FLOW)
+
+string G_VIS = "9. Display"
+string displayMode = input.string("NORMAL", "Mode", options=["NORMAL", "RESEARCH"], group=G_VIS)
+bool showLabels = input.bool(true, "Show zone labels", group=G_VIS)
+bool showDashboard = input.bool(true, "Show map dashboard", group=G_VIS)
+int projectionBars = input.int(48, "Zone projection bars", 12, 120, group=G_VIS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+// Sources
+int SRC_5M       = 1
+int SRC_15M      = 2
+int SRC_4H       = 3
+int SRC_DAY      = 4
+int SRC_WEEK     = 5
+int SRC_SESSION  = 6
+int SRC_MIX      = 9
+
+// States
+int ST_FRESH     = 1
+int ST_TESTED    = 2
+int ST_DEFENDED  = 3
+int ST_ACCEPTED  = 4
+int ST_WEAK      = 5
+int ST_CONSUMED  = 6
+
+float atr = ta.atr(atrLen)
+float tick = syminfo.mintick
+float clusterRadius = math.min(clusterMaxPts, math.max(clusterMinPts, atr * clusterAtrFrac))
+float baseHalfWidth = math.min(zoneHalfMaxPts, math.max(zoneHalfMinPts, atr * zoneHalfAtrFrac))
+float maxMergedWidth = math.min(maxClusterWidthPts, math.max(baseHalfWidth * 2.0, atr * maxClusterWidthAtr))
+float interactBuf = math.max(tick * 2.0, atr * interactionAtr)
+float acceptBuf = math.max(tick * 2.0, atr * acceptanceAtr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+f_srcBase(int src) =>
+    src == SRC_WEEK ? 8 :
+     src == SRC_DAY ? 7 :
+     src == SRC_4H ? 7 :
+     src == SRC_SESSION ? 6 :
+     src == SRC_15M ? 5 :
+     src == SRC_5M ? 3 : 4
+
+f_srcPriority(int src) =>
+    src == SRC_WEEK ? 8 :
+     src == SRC_DAY ? 7 :
+     src == SRC_4H ? 7 :
+     src == SRC_SESSION ? 6 :
+     src == SRC_15M ? 5 :
+     src == SRC_5M ? 3 : 1
+
+f_srcText(int src) =>
+    src == SRC_5M ? "5M" :
+     src == SRC_15M ? "15M" :
+     src == SRC_4H ? "4H" :
+     src == SRC_DAY ? "DAY" :
+     src == SRC_WEEK ? "WEEK" :
+     src == SRC_SESSION ? "SESSION" :
+     src == SRC_MIX ? "MIX" : "?"
+
+f_stateText(int st) =>
+    st == ST_FRESH ? "FRESH" :
+     st == ST_TESTED ? "TESTED" :
+     st == ST_DEFENDED ? "DEFENDED" :
+     st == ST_ACCEPTED ? "ACCEPTED" :
+     st == ST_WEAK ? "WEAK" :
+     st == ST_CONSUMED ? "CONSUMED" : "?"
+
+f_halfWidthFor(int src) =>
+    float mult = src == SRC_WEEK ? 1.45 :
+     src == SRC_DAY ? 1.25 :
+     src == SRC_4H ? 1.45 :
+     src == SRC_SESSION ? 1.10 :
+     src == SRC_15M ? 1.00 : 0.80
+    math.min(zoneHalfMaxPts, math.max(zoneHalfMinPts, baseHalfWidth * mult))
+
+f_mid(float lo, float hi) =>
+    (lo + hi) * 0.5
+
+f_clamp(float x, float lo, float hi) =>
+    math.min(hi, math.max(lo, x))
+
+f_ratioCode(float x) =>
+    na(x) ? 10 : math.min(31, math.max(0, int(math.round(x * 10.0))))
+
+f_weekdayCode(int ts, string tz) =>
+    int d = dayofweek(ts, tz)
+    d == dayofweek.monday ? 1 :
+     d == dayofweek.tuesday ? 2 :
+     d == dayofweek.wednesday ? 3 :
+     d == dayofweek.thursday ? 4 :
+     d == dayofweek.friday ? 5 : 0
+
+// Metadata packing for Bot2.
+// integer digits: SSSTTWWWW
+// SSS = significance strength (0..999)
+// TT  = state (0..99)
+// WWWW = half-width in ticks (0..9999)
+// Source is embedded in the fractional hundredths: + source / 100.
+// Decode in Bot2 from floor(meta), then round((meta-floor(meta))*100).
+f_packMeta(int strength, int state, float lo, float hi, int src) =>
+    int widthTicks = int(math.min(9999.0, math.round((hi - lo) * 0.5 / tick)))
+    float(strength * 1000000 + state * 10000 + widthTicks) + float(src) / 100.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTIVE REGISTRY (bounded, causal)
+// ─────────────────────────────────────────────────────────────────────────────
+var float[] zLo = array.new_float()
+var float[] zHi = array.new_float()
+var int[] zSource = array.new_int()
+var int[] zBase = array.new_int()
+var int[] zConfluence = array.new_int()
+var int[] zTouches = array.new_int()
+var int[] zRejects = array.new_int()
+var int[] zCrosses = array.new_int()
+var int[] zState = array.new_int()
+var int[] zCreatedBar = array.new_int()
+var int[] zUpdatedBar = array.new_int()
+var int[] zLastTouchBar = array.new_int()
+var int[] zAboveAccept = array.new_int()
+var int[] zBelowAccept = array.new_int()
+var int[] zVersion = array.new_int()
+
+// v0.4 per-zone reaction memory.
+// Reuses the existing separateTouchBars setting as the reaction observation window.
+var int[] zReactActive = array.new_int()
+var int[] zReactDir = array.new_int()
+var int[] zReactStartBar = array.new_int()
+var float[] zReactBase = array.new_float()
+var float[] zReactPeakAtr = array.new_float()
+var float[] zLastReactAtr = array.new_float()
+var float[] zPrevReactAtr = array.new_float()
+var int[] zReactPeakBar = array.new_int()
+var int[] zLastReactBars = array.new_int()
+var int[] zPrevReactBars = array.new_int()
+var int[] zLastAcceptDir = array.new_int()  // +1 accepted above, -1 accepted below, 0 unknown
+var int[] zAcceptAboveCount = array.new_int()
+var int[] zAcceptBelowCount = array.new_int()
+
+var int mapVersion = 1
+var int registryRevision = 1 // internal only; Bot2 mapVersion changes only when exposed battlefield changes
+
+f_zoneStrength(int i) =>
+    int base = array.get(zBase, i)
+    int conf = math.min(array.get(zConfluence, i), 4)
+    int touches = math.min(array.get(zTouches, i), 4)
+    int rejects = math.min(array.get(zRejects, i), 3)
+    int crosses = array.get(zCrosses, i)
+    int st = array.get(zState, i)
+    int age = bar_index - array.get(zUpdatedBar, i)
+
+    int bonus = conf + int(math.floor(touches * 0.5)) + rejects
+    bonus += st == ST_DEFENDED ? 2 : st == ST_TESTED ? 1 : 0
+    int penalty = crosses >= 2 ? crosses - 1 : 0
+    penalty += age > staleBars ? 2 : 0
+    int(math.max(0, math.min(20, base + bonus - penalty)))
+
+f_removeZone(int i) =>
+    array.remove(zLo, i)
+    array.remove(zHi, i)
+    array.remove(zSource, i)
+    array.remove(zBase, i)
+    array.remove(zConfluence, i)
+    array.remove(zTouches, i)
+    array.remove(zRejects, i)
+    array.remove(zCrosses, i)
+    array.remove(zState, i)
+    array.remove(zCreatedBar, i)
+    array.remove(zUpdatedBar, i)
+    array.remove(zLastTouchBar, i)
+    array.remove(zAboveAccept, i)
+    array.remove(zBelowAccept, i)
+    array.remove(zVersion, i)
+    array.remove(zReactActive, i)
+    array.remove(zReactDir, i)
+    array.remove(zReactStartBar, i)
+    array.remove(zReactBase, i)
+    array.remove(zReactPeakAtr, i)
+    array.remove(zLastReactAtr, i)
+    array.remove(zPrevReactAtr, i)
+    array.remove(zReactPeakBar, i)
+    array.remove(zLastReactBars, i)
+    array.remove(zPrevReactBars, i)
+    array.remove(zLastAcceptDir, i)
+    array.remove(zAcceptAboveCount, i)
+    array.remove(zAcceptBelowCount, i)
+
+f_lowestUtilityIndex() =>
+    int idx = -1
+    float worst = 1e10
+    int n = array.size(zLo)
+    if n > 0
+        for i = 0 to n - 1
+            float mid = f_mid(array.get(zLo, i), array.get(zHi, i))
+            int strength = f_zoneStrength(i)
+            float distAtr = math.abs(mid - close) / math.max(atr, tick)
+            int state = array.get(zState, i)
+            float utility = strength * 5.0 - distAtr
+            utility -= state == ST_CONSUMED ? 25.0 : 0.0
+            if utility < worst
+                worst := utility
+                idx := i
+    idx
+
+f_addOrMerge(float price, int src, float halfWidth) =>
+    bool changed = false
+    if not na(price) and not na(atr)
+        float candLo = price - halfWidth
+        float candHi = price + halfWidth
+        int best = -1
+        float bestDist = 1e10
+
+        int n = array.size(zLo)
+        if n > 0
+            for i = 0 to n - 1
+                if array.get(zState, i) != ST_CONSUMED
+                    float mid = f_mid(array.get(zLo, i), array.get(zHi, i))
+                    float d = math.abs(mid - price)
+                    if d <= clusterRadius and d < bestDist
+                        bestDist := d
+                        best := i
+
+        if best >= 0
+            float oldLo = array.get(zLo, best)
+            float oldHi = array.get(zHi, best)
+            float oldMid = f_mid(oldLo, oldHi)
+
+            float proposedLo = math.min(oldLo, candLo)
+            float proposedHi = math.max(oldHi, candHi)
+            float width = proposedHi - proposedLo
+
+            // Never let evidence clustering create giant danger bands.
+            if width > maxMergedWidth
+                float newMid = (oldMid * 2.0 + price) / 3.0
+                proposedLo := newMid - maxMergedWidth * 0.5
+                proposedHi := newMid + maxMergedWidth * 0.5
+
+            array.set(zLo, best, proposedLo)
+            array.set(zHi, best, proposedHi)
+
+            int oldSrc = array.get(zSource, best)
+            if oldSrc != src
+                array.set(zConfluence, best, math.min(9, array.get(zConfluence, best) + 1))
+                if f_srcPriority(src) > f_srcPriority(oldSrc)
+                    array.set(zSource, best, src)
+                else if f_srcPriority(src) == f_srcPriority(oldSrc) and src != oldSrc
+                    array.set(zSource, best, SRC_MIX)
+
+            array.set(zBase, best, math.max(array.get(zBase, best), f_srcBase(src)))
+            array.set(zUpdatedBar, best, bar_index)
+            array.set(zVersion, best, array.get(zVersion, best) + 1)
+            changed := true
+        else
+            array.push(zLo, candLo)
+            array.push(zHi, candHi)
+            array.push(zSource, src)
+            array.push(zBase, f_srcBase(src))
+            array.push(zConfluence, 1)
+            array.push(zTouches, 0)
+            array.push(zRejects, 0)
+            array.push(zCrosses, 0)
+            array.push(zState, ST_FRESH)
+            array.push(zCreatedBar, bar_index)
+            array.push(zUpdatedBar, bar_index)
+            array.push(zLastTouchBar, -1000000)
+            array.push(zAboveAccept, 0)
+            array.push(zBelowAccept, 0)
+            array.push(zVersion, 1)
+            array.push(zReactActive, 0)
+            array.push(zReactDir, 0)
+            array.push(zReactStartBar, -1000000)
+            array.push(zReactBase, na)
+            array.push(zReactPeakAtr, na)
+            array.push(zLastReactAtr, na)
+            array.push(zPrevReactAtr, na)
+            array.push(zReactPeakBar, -1000000)
+            array.push(zLastReactBars, 0)
+            array.push(zPrevReactBars, 0)
+            array.push(zLastAcceptDir, 0)
+            array.push(zAcceptAboveCount, 0)
+            array.push(zAcceptBelowCount, 0)
+            changed := true
+
+        while array.size(zLo) > maxZones
+            int kill = f_lowestUtilityIndex()
+            if kill >= 0
+                f_removeZone(kill)
+            else
+                break
+
+    changed
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CAUSAL LEVEL CANDIDATES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 5m pivots are only known swingLen5 bars AFTER the pivot.
+// Reaction qualification also uses only those completed bars.
+float ph5 = ta.pivothigh(high, swingLen5, swingLen5)
+float pl5 = ta.pivotlow(low, swingLen5, swingLen5)
+float pivotAtr5 = atr[swingLen5]
+
+bool ph5Qualified = false
+bool pl5Qualified = false
+if use5mReactionPivots and not na(ph5) and not na(pivotAtr5)
+    float postLow = ta.lowest(low, swingLen5 + 1)
+    ph5Qualified := (ph5 - postLow) >= pivotAtr5 * min5mReactionAtr
+if use5mReactionPivots and not na(pl5) and not na(pivotAtr5)
+    float postHigh = ta.highest(high, swingLen5 + 1)
+    pl5Qualified := (postHigh - pl5) >= pivotAtr5 * min5mReactionAtr
+
+// HTF pivots use gaps_on + lookahead_off. A pivot appears only on the 5m bar
+// where the confirming HTF bar has completed. It is never back-dated.
+float phSetup = request.security(syminfo.tickerid, setupTf,
+     ta.pivothigh(high, swingLenSetup, swingLenSetup),
+     gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+float plSetup = request.security(syminfo.tickerid, setupTf,
+     ta.pivotlow(low, swingLenSetup, swingLenSetup),
+     gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+
+float phMacro = request.security(syminfo.tickerid, macroTf,
+     ta.pivothigh(high, swingLenMacro, swingLenMacro),
+     gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+float plMacro = request.security(syminfo.tickerid, macroTf,
+     ta.pivotlow(low, swingLenMacro, swingLenMacro),
+     gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+
+// Prior day/week values are safe with [1] + lookahead_on: only the completed
+// prior period is visible during the current period.
+float priorDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float priorDayLow = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+float priorWeekHigh = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+float priorWeekLow = request.security(syminfo.tickerid, "W", low[1], lookahead=barmerge.lookahead_on)
+
+bool newDay = timeframe.change("D")
+bool newWeek = timeframe.change("W")
+
+// Session trackers. A completed session's H/L is admitted only when that
+// session ends, never while it is still developing.
+bool inAsia = not na(time(timeframe.period, asiaSession, nyTz))
+bool inLondon = not na(time(timeframe.period, londonSession, nyTz))
+bool inRth = not na(time(timeframe.period, rthSession, nyTz))
+
+var float asiaHi = na
+var float asiaLo = na
+var float londonHi = na
+var float londonLo = na
+var float rthHi = na
+var float rthLo = na
+
+if inAsia
+    asiaHi := na(asiaHi) ? high : math.max(asiaHi, high)
+    asiaLo := na(asiaLo) ? low : math.min(asiaLo, low)
+if inLondon
+    londonHi := na(londonHi) ? high : math.max(londonHi, high)
+    londonLo := na(londonLo) ? low : math.min(londonLo, low)
+if inRth
+    rthHi := na(rthHi) ? high : math.max(rthHi, high)
+    rthLo := na(rthLo) ? low : math.min(rthLo, low)
+
+bool asiaEnded = not inAsia and inAsia[1]
+bool londonEnded = not inLondon and inLondon[1]
+bool rthEnded = not inRth and inRth[1]
+
+// v0.5 OPENING / OVERNIGHT CONTEXT.
+// Factual context only. No entry/exit logic consumes it in the paired audit.
+bool inOvernightCtx = not na(time(timeframe.period, overnightContextSession, nyTz))
+bool overnightStartedCtx = inOvernightCtx and not inOvernightCtx[1]
+bool rthStartedCtx = inRth and not inRth[1]
+
+// Universal RTH VWAP observation. Factual only; never votes direction.
+var float eyeRthPv = 0.0
+var float eyeRthVol = 0.0
+if rthStartedCtx
+    eyeRthPv := hlc3 * volume
+    eyeRthVol := volume
+else if inRth
+    eyeRthPv += hlc3 * volume
+    eyeRthVol += volume
+else if not inRth and not inRth[1]
+    eyeRthPv := 0.0
+    eyeRthVol := 0.0
+float eyeRthVwap = inRth and eyeRthVol > 0 ? eyeRthPv / eyeRthVol : na
+
+var float overnightCtxHi = na
+var float overnightCtxLo = na
+var float dayOvernightHi = na
+var float dayOvernightLo = na
+var float prevRthCloseCtx = na
+var float rthOpenCtx = na
+var float rthHighCtx = na
+var float rthLowCtx = na
+var int rthStartBarCtx = na
+var int openLocationCode = 0
+var int gapCode = 0
+var int openingAuctionCode = 0
+var float openingRangeHi = na
+var float openingRangeLo = na
+var bool openingRangeComplete = false
+
+if overnightStartedCtx
+    overnightCtxHi := high
+    overnightCtxLo := low
+else if inOvernightCtx
+    overnightCtxHi := na(overnightCtxHi) ? high : math.max(overnightCtxHi, high)
+    overnightCtxLo := na(overnightCtxLo) ? low : math.min(overnightCtxLo, low)
+
+if rthEnded
+    prevRthCloseCtx := close[1]
+
+if rthStartedCtx
+    dayOvernightHi := overnightCtxHi
+    dayOvernightLo := overnightCtxLo
+    rthOpenCtx := open
+    rthHighCtx := high
+    rthLowCtx := low
+    rthStartBarCtx := bar_index
+    openingRangeHi := high
+    openingRangeLo := low
+    openingRangeComplete := false
+
+    float onRange = not na(dayOvernightHi) and not na(dayOvernightLo) ?
+         math.max(dayOvernightHi - dayOvernightLo, tick) : na
+
+    if not na(onRange)
+        openLocationCode := rthOpenCtx < dayOvernightLo ? 1 :
+             rthOpenCtx > dayOvernightHi ? 5 :
+             rthOpenCtx < dayOvernightLo + onRange / 3.0 ? 2 :
+             rthOpenCtx < dayOvernightLo + onRange * 2.0 / 3.0 ? 3 : 4
+        openingAuctionCode := rthOpenCtx > dayOvernightHi ? 2 :
+             rthOpenCtx < dayOvernightLo ? 3 : 1
+    else
+        openLocationCode := 0
+        openingAuctionCode := 0
+
+    if not na(prevRthCloseCtx)
+        float gapAtr = (rthOpenCtx - prevRthCloseCtx) / math.max(atr, tick)
+        gapCode := gapAtr <= -1.0 ? 1 :
+             gapAtr < -0.25 ? 2 :
+             gapAtr <= 0.25 ? 3 :
+             gapAtr < 1.0 ? 4 : 5
+    else
+        gapCode := 0
+
+if inRth and not na(rthStartBarCtx)
+    rthHighCtx := na(rthHighCtx) ? high : math.max(rthHighCtx, high)
+    rthLowCtx := na(rthLowCtx) ? low : math.min(rthLowCtx, low)
+    int rthBarsFromOpen = bar_index - rthStartBarCtx
+
+    if rthBarsFromOpen <= 5
+        openingRangeHi := na(openingRangeHi) ? high : math.max(openingRangeHi, high)
+        openingRangeLo := na(openingRangeLo) ? low : math.min(openingRangeLo, low)
+    else
+        openingRangeComplete := true
+
+    // Preserve the first meaningful transition versus the overnight range
+    // during the first cash-session hour.
+    if rthBarsFromOpen <= 11 and not na(dayOvernightHi) and not na(dayOvernightLo)
+        bool backInsideOvernight = close <= dayOvernightHi and close >= dayOvernightLo
+
+        if openingAuctionCode == 2 and backInsideOvernight
+            openingAuctionCode := 4
+        else if openingAuctionCode == 3 and backInsideOvernight
+            openingAuctionCode := 5
+        else if openingAuctionCode == 1 and close > dayOvernightHi
+            openingAuctionCode := 6
+        else if openingAuctionCode == 1 and close < dayOvernightLo
+            openingAuctionCode := 7
+
+int openingRangeCode = not openingRangeComplete or na(openingRangeHi) or na(openingRangeLo) ? 0 :
+     close > openingRangeHi ? 3 :
+     close < openingRangeLo ? 1 : 2
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 MARKET CLOCK — SAME WEEKDAY / SAME 5-MINUTE RTH SLOT
+// Baseline is read before current bar updates its slot. Research only.
+// ─────────────────────────────────────────────────────────────────────────────
+int weekdayCode = f_weekdayCode(time, nyTz)
+int minutesFromRthOpen = hour(time, nyTz) * 60 + minute(time, nyTz) - 570
+int rthSlotCode = inRth and weekdayCode >= 1 and weekdayCode <= 5 and
+     minutesFromRthOpen >= 0 and minutesFromRthOpen < 390 ?
+     int(math.floor(minutesFromRthOpen / 5)) + 1 : 0
+int clockIndex = rthSlotCode > 0 ? (weekdayCode - 1) * 78 + (rthSlotCode - 1) : -1
+
+var float[] clockVolExp = array.new_float(390, na)
+var float[] clockTrExp = array.new_float(390, na)
+var float[] clockEffExp = array.new_float(390, na)
+var float[] clockCumVolExp = array.new_float(390, na)
+var float[] clockCumTrExp = array.new_float(390, na)
+var int[] clockSamples = array.new_int(390, 0)
+
+var float rthCumVolume = 0.0
+var float rthCumTrueRange = 0.0
+
+if rthStartedCtx
+    rthCumVolume := 0.0
+    rthCumTrueRange := 0.0
+
+float clockTrNow = ta.tr(true)
+float clockBarRange = math.max(high - low, tick)
+float clockBarEffNow = math.abs(close - open) / clockBarRange
+
+if inRth
+    rthCumVolume += volume
+    rthCumTrueRange += clockTrNow
+
+int clockSampleCount = clockIndex >= 0 ? array.get(clockSamples, clockIndex) : 0
+bool clockReady = clockIndex >= 0 and clockSampleCount >= clockMinSamples
+
+float expClockVol = clockIndex >= 0 ? array.get(clockVolExp, clockIndex) : na
+float expClockTr = clockIndex >= 0 ? array.get(clockTrExp, clockIndex) : na
+float expClockEff = clockIndex >= 0 ? array.get(clockEffExp, clockIndex) : na
+float expCumVol = clockIndex >= 0 ? array.get(clockCumVolExp, clockIndex) : na
+float expCumTr = clockIndex >= 0 ? array.get(clockCumTrExp, clockIndex) : na
+
+float clockRelVol = clockReady and not na(expClockVol) and expClockVol > 0 ? volume / expClockVol : 1.0
+float clockRelRange = clockReady and not na(expClockTr) and expClockTr > 0 ? clockTrNow / expClockTr : 1.0
+float clockRelEfficiency = clockReady and not na(expClockEff) and expClockEff > 0 ? clockBarEffNow / expClockEff : 1.0
+float clockVolumePace = clockReady and not na(expCumVol) and expCumVol > 0 ? rthCumVolume / expCumVol : 1.0
+float clockRangePace = clockReady and not na(expCumTr) and expCumTr > 0 ? rthCumTrueRange / expCumTr : 1.0
+
+if clockIndex >= 0
+    float clockAlpha = 2.0 / (float(clockBaselineWeeks) + 1.0)
+    int oldCount = array.get(clockSamples, clockIndex)
+
+    float oldVol = array.get(clockVolExp, clockIndex)
+    float oldTr = array.get(clockTrExp, clockIndex)
+    float oldEff = array.get(clockEffExp, clockIndex)
+    float oldCumVol = array.get(clockCumVolExp, clockIndex)
+    float oldCumTr = array.get(clockCumTrExp, clockIndex)
+
+    array.set(clockVolExp, clockIndex, oldCount == 0 or na(oldVol) ? volume : oldVol + clockAlpha * (volume - oldVol))
+    array.set(clockTrExp, clockIndex, oldCount == 0 or na(oldTr) ? clockTrNow : oldTr + clockAlpha * (clockTrNow - oldTr))
+    array.set(clockEffExp, clockIndex, oldCount == 0 or na(oldEff) ? clockBarEffNow : oldEff + clockAlpha * (clockBarEffNow - oldEff))
+    array.set(clockCumVolExp, clockIndex, oldCount == 0 or na(oldCumVol) ? rthCumVolume : oldCumVol + clockAlpha * (rthCumVolume - oldCumVol))
+    array.set(clockCumTrExp, clockIndex, oldCount == 0 or na(oldCumTr) ? rthCumTrueRange : oldCumTr + clockAlpha * (rthCumTrueRange - oldCumTr))
+    array.set(clockSamples, clockIndex, oldCount + 1)
+
+// Deterministic quarterly contract mechanics. Context only.
+int monthNy = month(time, nyTz)
+int domNy = dayofmonth(time, nyTz)
+int dowNy = dayofweek(time, nyTz)
+bool quarterMonth = monthNy == 3 or monthNy == 6 or monthNy == 9 or monthNy == 12
+int daysUntilFriday = (dayofweek.friday - dowNy + 7) % 7
+int upcomingFridayDom = domNy + daysUntilFriday
+bool quarterlyExpiration = quarterMonth and dowNy == dayofweek.friday and domNy >= 15 and domNy <= 21
+bool quarterlyRollWindow = quarterMonth and dowNy >= dayofweek.monday and dowNy <= dayofweek.thursday and
+     upcomingFridayDom >= 15 and upcomingFridayDom <= 21
+int calendarCode = quarterlyExpiration ? 2 : quarterlyRollWindow ? 1 : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.6 CROSS-MARKET CONTEXT — DESCRIPTIVE ONLY
+// ─────────────────────────────────────────────────────────────────────────────
+float esCloseCtx = request.security(benchmarkContextSymbol, timeframe.period, close,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+float esAtrCtx = request.security(benchmarkContextSymbol, timeframe.period, ta.atr(atrLen),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+float nqMove3Atr = atr > tick and not na(close[3]) ? (close - close[3]) / atr : 0.0
+float esMove3Atr = not na(esCloseCtx[3]) and not na(esAtrCtx) and esAtrCtx > 0 ?
+     (esCloseCtx - esCloseCtx[3]) / esAtrCtx : 0.0
+
+bool nqMoveUp = nqMove3Atr >= crossMoveAtr
+bool nqMoveDn = nqMove3Atr <= -crossMoveAtr
+bool esMoveUp = esMove3Atr >= crossMoveAtr
+bool esMoveDn = esMove3Atr <= -crossMoveAtr
+
+// 0 off/unavailable, 1 up agreement, 2 down agreement,
+// 3 NQ-up divergence, 4 NQ-down divergence, 5 mixed.
+int esContextCode = not useCrossMarketContext or na(esCloseCtx) ? 0 :
+     nqMoveUp and esMoveUp ? 1 :
+     nqMoveDn and esMoveDn ? 2 :
+     nqMoveUp and not esMoveUp ? 3 :
+     nqMoveDn and not esMoveDn ? 4 : 5
+
+// v1.2 additive cross-market detail. Legacy BUS11 above is preserved exactly.
+// The old "divergence" bucket combines leadership (benchmark neutral) with
+// true opposition (benchmark moving the other way). BUS20 keeps them separate.
+// 0 unavailable, 1 UP_AGREE, 2 DN_AGREE, 3 NQ_UP_LEAD, 4 NQ_DN_LEAD,
+// 5 NQ_UP_VS_ES_DN, 6 NQ_DN_VS_ES_UP, 7 ES_UP_LEAD, 8 ES_DN_LEAD, 9 NEUTRAL.
+int crossDetailCode = not useCrossMarketContext or na(esCloseCtx) ? 0 :
+     nqMoveUp and esMoveUp ? 1 :
+     nqMoveDn and esMoveDn ? 2 :
+     nqMoveUp and esMoveDn ? 5 :
+     nqMoveDn and esMoveUp ? 6 :
+     nqMoveUp ? 3 :
+     nqMoveDn ? 4 :
+     esMoveUp ? 7 :
+     esMoveDn ? 8 : 9
+
+f_crossMoveCode(float x) =>
+    int(math.round(math.min(3.0, math.max(-3.0, nz(x))) * 10.0)) + 30
+
+// Signature 41. Pack detail + raw-ish normalized NQ/ES 3-bar moves (0.1 ATR bins).
+int crossDetailBusInt = 41
+crossDetailBusInt := crossDetailBusInt * 10 + crossDetailCode
+crossDetailBusInt := crossDetailBusInt * 61 + f_crossMoveCode(nqMove3Atr)
+crossDetailBusInt := crossDetailBusInt * 61 + f_crossMoveCode(esMove3Atr)
+float crossDetailBus = float(crossDetailBusInt)
+
+// v1.4 one-bar lead/lag + RTH path facts. This does not predict direction.
+// It only says who moved first / whether NQ is catching up or moving without
+// benchmark confirmation, plus where the current RTH auction sits.
+float nqMove1Atr = atr > tick and not na(close[1]) ? (close - close[1]) / atr : 0.0
+float esMove1Atr = not na(esCloseCtx[1]) and not na(esAtrCtx) and esAtrCtx > 0 ?
+     (esCloseCtx - esCloseCtx[1]) / esAtrCtx : 0.0
+float leadThr = math.max(0.08, crossMoveAtr * 0.60)
+float neutralThr = leadThr * 0.50
+bool nq1Up = nqMove1Atr >= leadThr
+bool nq1Dn = nqMove1Atr <= -leadThr
+bool es1Up = esMove1Atr >= leadThr
+bool es1Dn = esMove1Atr <= -leadThr
+bool prevNqNeutral = math.abs(nz(nqMove1Atr[1])) < neutralThr
+bool prevEsNeutral = math.abs(nz(esMove1Atr[1])) < neutralThr
+bool prevEsUp = nz(esMove1Atr[1]) >= leadThr
+bool prevEsDn = nz(esMove1Atr[1]) <= -leadThr
+bool prevNqUp = nz(nqMove1Atr[1]) >= leadThr
+bool prevNqDn = nz(nqMove1Atr[1]) <= -leadThr
+
+// 0 unavailable, 1 UP_CATCHUP, 2 DN_CATCHUP, 3 UP_AGREE, 4 DN_AGREE,
+// 5 NQ_UP_UNCONF, 6 NQ_DN_UNCONF, 7 ES_UP_LEAD, 8 ES_DN_LEAD,
+// 9 MIXED, 10 NEUTRAL.
+int leadLagCode = not useCrossMarketContext or na(esCloseCtx) ? 0 :
+     (prevEsUp and prevNqNeutral and nq1Up) ? 1 :
+     (prevEsDn and prevNqNeutral and nq1Dn) ? 2 :
+     (nq1Up and es1Up) ? 3 :
+     (nq1Dn and es1Dn) ? 4 :
+     // v1.5 semantic fix: TRUE opposition must be classified before the
+     // broader "NQ unconfirmed" / "ES lead" buckets, otherwise MIX is unreachable.
+     ((nq1Up and es1Dn) or (nq1Dn and es1Up)) ? 9 :
+     (nq1Up and not es1Up and not es1Dn) ? 5 :
+     (nq1Dn and not es1Dn and not es1Up) ? 6 :
+     (es1Up and not nq1Up and not nq1Dn) ? 7 :
+     (es1Dn and not nq1Dn and not nq1Up) ? 8 : 10
+
+float rthDispAtrFact = inRth and not na(rthOpenCtx) and atr > tick ? (close - rthOpenCtx) / atr : 0.0
+float rthSpanFact = inRth and not na(rthHighCtx) and not na(rthLowCtx) ? math.max(rthHighCtx - rthLowCtx, tick) : na
+float rthLocationFact = not na(rthSpanFact) ? math.max(0.0, math.min(1.0, (close - rthLowCtx) / rthSpanFact)) : na
+int rthLocationCode = na(rthLocationFact) ? 0 :
+     math.min(10, int(math.floor(math.min(0.999, rthLocationFact) * 10.0)) + 1)
+int latePhaseCode = not inRth or rthSlotCode <= 0 ? 0 :
+     rthSlotCode >= 76 ? 4 :
+     rthSlotCode >= 73 ? 3 :
+     rthSlotCode >= 67 ? 2 : 1
+
+// BUS23 signature 59.
+int flowBusInt = 59
+flowBusInt := flowBusInt * 11 + leadLagCode
+flowBusInt := flowBusInt * 61 + f_crossMoveCode(rthDispAtrFact)
+flowBusInt := flowBusInt * 11 + rthLocationCode
+flowBusInt := flowBusInt * 5 + latePhaseCode
+float flowBus = float(flowBusInt)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.3 MULTI-HORIZON FACTS — DESCRIPTIVE ONLY
+//
+// Problem being measured: a 5m failed auction / discovery event can mean very
+// different things inside a 15m pullback, a 4H directional auction, or an
+// exhausted higher-timeframe move.  Bot1 must expose those facts without voting.
+//
+// Every value below is based on the PREVIOUS COMPLETED HTF bar.  The [1]-shifted
+// expressions combined with lookahead_on prevent a developing 15m/4H bar from
+// leaking future information into the 5m brain.
+// ─────────────────────────────────────────────────────────────────────────────
+const int HTF_SETUP_FACT_LOOKBACK = 8   // 8 completed setup bars; default 15m ≈ 2h
+const int HTF_MACRO_FACT_LOOKBACK = 6   // 6 completed macro bars; default 4H ≈ 24h
+
+f_prevHtfDispAtr(int n) =>
+    float hAtr = ta.atr(atrLen)[1]
+    float hDisp = not na(close[n + 1]) ? close[1] - close[n + 1] : na
+    not na(hAtr) and hAtr > syminfo.mintick ? hDisp / hAtr : na
+
+f_prevHtfEfficiency(int n) =>
+    float hPath = math.sum(math.abs(close[1] - close[2]), n)
+    float hDispAbs = not na(close[n + 1]) ? math.abs(close[1] - close[n + 1]) : na
+    not na(hPath) and hPath > syminfo.mintick and not na(hDispAbs) ? hDispAbs / hPath : na
+
+f_prevHtfLocation(int n) =>
+    float hHi = ta.highest(high[1], n)
+    float hLo = ta.lowest(low[1], n)
+    not na(hHi) and not na(hLo) and hHi > hLo ? (close[1] - hLo) / (hHi - hLo) : na
+
+float setupDispAtrFact = request.security(syminfo.tickerid, setupTf, f_prevHtfDispAtr(HTF_SETUP_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+float setupEfficiencyFact = request.security(syminfo.tickerid, setupTf, f_prevHtfEfficiency(HTF_SETUP_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+float setupLocationFact = request.security(syminfo.tickerid, setupTf, f_prevHtfLocation(HTF_SETUP_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+float macroDispAtrFact = request.security(syminfo.tickerid, macroTf, f_prevHtfDispAtr(HTF_MACRO_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+float macroEfficiencyFact = request.security(syminfo.tickerid, macroTf, f_prevHtfEfficiency(HTF_MACRO_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+float macroLocationFact = request.security(syminfo.tickerid, macroTf, f_prevHtfLocation(HTF_MACRO_FACT_LOOKBACK),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// Compact quantization.  These are measurements, not directional votes.
+// displacement: -10..+10 ATR in 0.5 ATR bins (41 = unknown)
+// efficiency/location: 0..1 in .05 bins (21 = unknown)
+f_htfDispCode(float x) =>
+    na(x) ? 41 : int(math.min(40.0, math.max(0.0, math.round(x * 2.0) + 20.0)))
+
+f_htfUnitCode(float x) =>
+    na(x) ? 21 : int(math.min(20.0, math.max(0.0, math.round(math.min(1.0, math.max(0.0, x)) * 20.0))))
+
+// BUS21 exact mixed-radix packing. Signature 37.
+// Fields: setup dispATR, setup efficiency, setup range-location,
+//         macro dispATR, macro efficiency, macro range-location.
+int multiHtfBusInt = 37
+multiHtfBusInt := multiHtfBusInt * 42 + f_htfDispCode(setupDispAtrFact)
+multiHtfBusInt := multiHtfBusInt * 22 + f_htfUnitCode(setupEfficiencyFact)
+multiHtfBusInt := multiHtfBusInt * 22 + f_htfUnitCode(setupLocationFact)
+multiHtfBusInt := multiHtfBusInt * 42 + f_htfDispCode(macroDispAtrFact)
+multiHtfBusInt := multiHtfBusInt * 22 + f_htfUnitCode(macroEfficiencyFact)
+multiHtfBusInt := multiHtfBusInt * 22 + f_htfUnitCode(macroLocationFact)
+float multiHtfBus = float(multiHtfBusInt)
+
+float vixCloseCtx = request.security(vixContextSymbol, timeframe.period, close,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+float vixPrevDaily = request.security(vixContextSymbol, "D", close[1],
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+float vixSma20Prev = request.security(vixContextSymbol, "D", ta.sma(close, 20)[1],
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+float vixMove3Pct = not na(vixCloseCtx[3]) and vixCloseCtx[3] != 0 ?
+     100.0 * (vixCloseCtx / vixCloseCtx[3] - 1.0) : 0.0
+
+// 0 off/unavailable, 1 low, 2 normal, 3 elevated.
+int vixLevelCode = not useCrossMarketContext or na(vixPrevDaily) or na(vixSma20Prev) or vixSma20Prev <= 0 ? 0 :
+     vixPrevDaily < vixSma20Prev * 0.85 ? 1 :
+     vixPrevDaily > vixSma20Prev * 1.15 ? 3 : 2
+
+// 0 off/unavailable, 1 fast down, 2 down, 3 quiet, 4 up, 5 fast up.
+int vixMoveCode = not useCrossMarketContext or na(vixCloseCtx) ? 0 :
+     vixMove3Pct <= -1.50 ? 1 :
+     vixMove3Pct <= -0.50 ? 2 :
+     vixMove3Pct < 0.50 ? 3 :
+     vixMove3Pct < 1.50 ? 4 : 5
+
+// Admit candidates. Any change increments mapVersion.
+// NOTE: drawings may show the current merged band, but Bot2 only receives the
+// sequential BUS values calculated AFTER each causal admission.
+bool mapChanged = false
+
+if ph5Qualified
+    mapChanged := f_addOrMerge(ph5, SRC_5M, f_halfWidthFor(SRC_5M)) or mapChanged
+if pl5Qualified
+    mapChanged := f_addOrMerge(pl5, SRC_5M, f_halfWidthFor(SRC_5M)) or mapChanged
+
+if not na(phSetup)
+    mapChanged := f_addOrMerge(phSetup, SRC_15M, f_halfWidthFor(SRC_15M)) or mapChanged
+if not na(plSetup)
+    mapChanged := f_addOrMerge(plSetup, SRC_15M, f_halfWidthFor(SRC_15M)) or mapChanged
+
+if not na(phMacro)
+    mapChanged := f_addOrMerge(phMacro, SRC_4H, f_halfWidthFor(SRC_4H)) or mapChanged
+if not na(plMacro)
+    mapChanged := f_addOrMerge(plMacro, SRC_4H, f_halfWidthFor(SRC_4H)) or mapChanged
+
+if usePriorDayWeek and newDay
+    mapChanged := f_addOrMerge(priorDayHigh, SRC_DAY, f_halfWidthFor(SRC_DAY)) or mapChanged
+    mapChanged := f_addOrMerge(priorDayLow, SRC_DAY, f_halfWidthFor(SRC_DAY)) or mapChanged
+
+if usePriorDayWeek and newWeek
+    mapChanged := f_addOrMerge(priorWeekHigh, SRC_WEEK, f_halfWidthFor(SRC_WEEK)) or mapChanged
+    mapChanged := f_addOrMerge(priorWeekLow, SRC_WEEK, f_halfWidthFor(SRC_WEEK)) or mapChanged
+
+if useSessions and asiaEnded
+    mapChanged := f_addOrMerge(asiaHi, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    mapChanged := f_addOrMerge(asiaLo, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    asiaHi := na
+    asiaLo := na
+
+if useSessions and londonEnded
+    mapChanged := f_addOrMerge(londonHi, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    mapChanged := f_addOrMerge(londonLo, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    londonHi := na
+    londonLo := na
+
+if useSessions and rthEnded
+    mapChanged := f_addOrMerge(rthHi, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    mapChanged := f_addOrMerge(rthLo, SRC_SESSION, f_halfWidthFor(SRC_SESSION)) or mapChanged
+    rthHi := na
+    rthLo := na
+
+if mapChanged
+    registryRevision += 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIFECYCLE UPDATE — only facts known on this bar
+// ─────────────────────────────────────────────────────────────────────────────
+int zn = array.size(zLo)
+if zn > 0 and not na(atr)
+    for i = 0 to zn - 1
+        float lo = array.get(zLo, i)
+        float hi = array.get(zHi, i)
+        float mid = f_mid(lo, hi)
+        int st = array.get(zState, i)
+
+        bool interacted = high >= lo - interactBuf and low <= hi + interactBuf
+        int lastTouch = array.get(zLastTouchBar, i)
+        bool separateInteraction = interacted and bar_index - lastTouch >= separateTouchBars
+
+        // Extend/finalize a previously-started rejection response.
+        if array.get(zReactActive, i) == 1
+            int reactDir = array.get(zReactDir, i)
+            int reactStart = array.get(zReactStartBar, i)
+            float reactBase = array.get(zReactBase, i)
+            float reactPeak = nz(array.get(zReactPeakAtr, i), 0.0)
+            float thisReactAtr = reactDir > 0 ?
+                 math.max(0.0, high - reactBase) / math.max(atr, tick) :
+                 math.max(0.0, reactBase - low) / math.max(atr, tick)
+
+            if thisReactAtr > reactPeak
+                reactPeak := thisReactAtr
+                array.set(zReactPeakBar, i, bar_index)
+
+            array.set(zReactPeakAtr, i, reactPeak)
+
+            if bar_index - reactStart >= separateTouchBars
+                int peakBar = array.get(zReactPeakBar, i)
+                int reactionBars = math.max(1, peakBar - reactStart + 1)
+                array.set(zPrevReactAtr, i, array.get(zLastReactAtr, i))
+                array.set(zPrevReactBars, i, array.get(zLastReactBars, i))
+                array.set(zLastReactAtr, i, reactPeak)
+                array.set(zLastReactBars, i, reactionBars)
+                array.set(zReactActive, i, 0)
+
+        if separateInteraction
+            array.set(zTouches, i, array.get(zTouches, i) + 1)
+            array.set(zLastTouchBar, i, bar_index)
+            array.set(zUpdatedBar, i, bar_index)
+            if st == ST_FRESH
+                array.set(zState, i, ST_TESTED)
+
+        // A "defense" means price interacted with the zone and closed clearly
+        // away from its midpoint on the same side from which it approached.
+        bool approachedFromBelow = close[1] < lo and high >= lo
+        bool approachedFromAbove = close[1] > hi and low <= hi
+        bool rejectDown = approachedFromBelow and close < lo
+        bool rejectUp = approachedFromAbove and close > hi
+        if rejectDown or rejectUp
+            array.set(zRejects, i, array.get(zRejects, i) + 1)
+            array.set(zState, i, ST_DEFENDED)
+            array.set(zUpdatedBar, i, bar_index)
+
+            // Record distinct rejection responses only. Original v0.3 lifecycle is unchanged.
+            if useContextSensors and separateInteraction
+                int newReactDir = rejectUp ? 1 : -1
+                float newReactBase = rejectUp ? hi : lo
+                float newReactPeak = rejectUp ?
+                     math.max(0.0, close - hi) / math.max(atr, tick) :
+                     math.max(0.0, lo - close) / math.max(atr, tick)
+                array.set(zReactActive, i, 1)
+                array.set(zReactDir, i, newReactDir)
+                array.set(zReactStartBar, i, bar_index)
+                array.set(zReactBase, i, newReactBase)
+                array.set(zReactPeakAtr, i, newReactPeak)
+                array.set(zReactPeakBar, i, bar_index)
+
+        int aboveN = close > hi + acceptBuf ? array.get(zAboveAccept, i) + 1 : 0
+        int belowN = close < lo - acceptBuf ? array.get(zBelowAccept, i) + 1 : 0
+        array.set(zAboveAccept, i, aboveN)
+        array.set(zBelowAccept, i, belowN)
+
+        if aboveN == acceptCloses or belowN == acceptCloses
+            int acceptDirNow = aboveN == acceptCloses ? 1 : -1
+            array.set(zLastAcceptDir, i, acceptDirNow)
+            if acceptDirNow > 0
+                array.set(zAcceptAboveCount, i, array.get(zAcceptAboveCount, i) + 1)
+            else
+                array.set(zAcceptBelowCount, i, array.get(zAcceptBelowCount, i) + 1)
+            array.set(zCrosses, i, array.get(zCrosses, i) + 1)
+            array.set(zState, i, ST_ACCEPTED)
+            array.set(zUpdatedBar, i, bar_index)
+            registryRevision += 1
+
+        int crosses = array.get(zCrosses, i)
+        if crosses >= maxCrossesBeforeConsumed
+            array.set(zState, i, ST_CONSUMED)
+
+        // Repeated two-way trade means the area has become less informative.
+        if crosses >= math.max(2, maxCrossesBeforeConsumed - 2) and array.get(zTouches, i) >= 5 and array.get(zState, i) != ST_CONSUMED
+            array.set(zState, i, ST_WEAK)
+
+        // Far + stale + weak zones are retired from the working registry.
+        int age = bar_index - array.get(zUpdatedBar, i)
+        float distAtr = math.abs(mid - close) / math.max(atr, tick)
+        if age > staleBars and distAtr > pruneDistanceAtr and f_zoneStrength(i) < 6
+            array.set(zState, i, ST_CONSUMED)
+
+// Physically prune consumed zones only when they are no longer near price.
+// This keeps the working set bounded without erasing history already processed.
+if array.size(zLo) > 0
+    for k = array.size(zLo) - 1 to 0
+        if array.get(zState, k) == ST_CONSUMED
+            float mid = f_mid(array.get(zLo, k), array.get(zHi, k))
+            float distAtr = math.abs(mid - close) / math.max(atr, tick)
+            if distAtr > 6.0 or array.size(zLo) > maxZones
+                f_removeZone(k)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAP SELECTOR
+// Finds nearest + next meaningful zones on each side.
+// "Significance" is descriptive importance, NOT a directional trade score.
+// ─────────────────────────────────────────────────────────────────────────────
+int r1 = -1
+int r2 = -1
+int s1 = -1
+int s2 = -1
+float r1Dist = 1e10
+float r2Dist = 1e10
+float s1Dist = 1e10
+float s2Dist = 1e10
+
+zn := array.size(zLo)
+if zn > 0
+    for i = 0 to zn - 1
+        if array.get(zState, i) != ST_CONSUMED
+            int strength = f_zoneStrength(i)
+            if strength >= 3
+                float lo = array.get(zLo, i)
+                float hi = array.get(zHi, i)
+                float mid = f_mid(lo, hi)
+
+                if mid >= close
+                    float d = mid - close
+                    if d < r1Dist
+                        r2 := r1
+                        r2Dist := r1Dist
+                        r1 := i
+                        r1Dist := d
+                    else if d < r2Dist
+                        r2 := i
+                        r2Dist := d
+                else
+                    float d = close - mid
+                    if d < s1Dist
+                        s2 := s1
+                        s2Dist := s1Dist
+                        s1 := i
+                        s1Dist := d
+                    else if d < s2Dist
+                        s2 := i
+                        s2Dist := d
+
+f_centerFor(int idx) =>
+    idx >= 0 ? f_mid(array.get(zLo, idx), array.get(zHi, idx)) : na
+
+f_metaFor(int idx) =>
+    idx >= 0 ? f_packMeta(f_zoneStrength(idx), array.get(zState, idx), array.get(zLo, idx), array.get(zHi, idx), array.get(zSource, idx)) : na
+
+float r1Center = f_centerFor(r1)
+float r2Center = f_centerFor(r2)
+float s1Center = f_centerFor(s1)
+float s2Center = f_centerFor(s2)
+float r1Meta = f_metaFor(r1)
+float s1Meta = f_metaFor(s1)
+
+// v0.4.1 reaction-memory code for current R1/S1.
+// 0 none, 1 fresh, 2 one defense, 3 strengthening, 4 stable,
+// 5 weakening, 6 worn/heavily tested,
+// 7 accepted ABOVE, 8 accepted BELOW, 9 consumed/mixed.
+f_reactionCode(int idx) =>
+    int code = 0
+    if idx >= 0
+        int stx = array.get(zState, idx)
+        int touches = array.get(zTouches, idx)
+        int rejects = array.get(zRejects, idx)
+        int crosses = array.get(zCrosses, idx)
+        int acceptDir = array.get(zLastAcceptDir, idx)
+        float lastRx = array.get(zLastReactAtr, idx)
+        float prevRx = array.get(zPrevReactAtr, idx)
+
+        if stx == ST_CONSUMED
+            code := 9
+        else if stx == ST_ACCEPTED
+            code := acceptDir > 0 ? 7 : acceptDir < 0 ? 8 : 9
+        else if stx == ST_WEAK or crosses >= 2 or touches >= 6
+            code := 6
+        else if na(lastRx)
+            code := rejects > 0 ? 2 : 1
+        else if na(prevRx) or prevRx <= 0
+            code := 2
+        else
+            float ratio = lastRx / prevRx
+            code := ratio > 1.0 + reactionTrendBand ? 3 :
+                 ratio < 1.0 - reactionTrendBand ? 5 : 4
+    code
+
+f_touchBucket(int idx) =>
+    idx >= 0 ? math.min(9, array.get(zTouches, idx)) : 0
+
+// Battle code describes how repeated interaction with a level is evolving.
+// 0 none, 1 fresh, 2 first defense, 3 strengthening defense,
+// 4 mixed/stable, 5 weakening defense, 6 two-way acceptance,
+// 7 repeated acceptance above, 8 repeated acceptance below, 9 consumed.
+f_battleCode(int idx) =>
+    int code = 0
+    if idx >= 0
+        int stx = array.get(zState, idx)
+        int rejects = array.get(zRejects, idx)
+        int accUp = array.get(zAcceptAboveCount, idx)
+        int accDn = array.get(zAcceptBelowCount, idx)
+        float lastRx = array.get(zLastReactAtr, idx)
+        float prevRx = array.get(zPrevReactAtr, idx)
+        int lastBars = array.get(zLastReactBars, idx)
+        int prevBars = array.get(zPrevReactBars, idx)
+
+        if stx == ST_CONSUMED
+            code := 9
+        else if accUp > 0 and accDn > 0
+            code := 6
+        else if accUp >= 2
+            code := 7
+        else if accDn >= 2
+            code := 8
+        else if na(lastRx)
+            code := rejects > 0 ? 2 : 1
+        else if na(prevRx) or prevRx <= 0 or lastBars <= 0 or prevBars <= 0
+            code := 2
+        else
+            float distRatio = lastRx / prevRx
+            float lastSpeed = lastRx / float(lastBars)
+            float prevSpeed = prevRx / float(prevBars)
+            float speedRatio = prevSpeed > 0 ? lastSpeed / prevSpeed : 1.0
+
+            code := distRatio > 1.0 + reactionTrendBand and speedRatio > 1.0 + reactionTrendBand ? 3 :
+                 distRatio < 1.0 - reactionTrendBand and speedRatio < 1.0 - reactionTrendBand ? 5 : 4
+    code
+
+int r1ReactionCode = useContextSensors ? f_reactionCode(r1) : 0
+int s1ReactionCode = useContextSensors ? f_reactionCode(s1) : 0
+int r1TouchBucket = useContextSensors ? f_touchBucket(r1) : 0
+int s1TouchBucket = useContextSensors ? f_touchBucket(s1) : 0
+int r1BattleCode = useContextSensors ? f_battleCode(r1) : 0
+int s1BattleCode = useContextSensors ? f_battleCode(s1) : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CAUSAL AUCTION-BALANCE ENGINE
+//
+// Balance is not merely a small rolling range. We require a combination of:
+//   • bounded territory,
+//   • low net travel versus path traveled,
+//   • repeated bar overlap / rotation, and
+//   • persistent closes through the middle of the observed range.
+//
+// Once balance is established its boundaries freeze. Wicks outside are tests.
+// Only consecutive closes outside the boundary + buffer count as acceptance.
+// This gives Bot2 a causal sequence:
+// BALANCE -> TEST / FAILED ESCAPE -> ACCEPTED EXPANSION.
+// ─────────────────────────────────────────────────────────────────────────────
+float obsHi = ta.highest(high, balanceLookback)
+float obsLo = ta.lowest(low, balanceLookback)
+float obsRange = obsHi - obsLo
+float obsPath = math.sum(math.abs(close - close[1]), balanceLookback)
+float obsDisp = math.abs(close - close[balanceLookback])
+float auctionEfficiency = not na(obsPath) and obsPath > tick and not na(obsDisp) ? obsDisp / obsPath : na
+
+float thisRange = math.max(high - low, tick)
+float prevRange = math.max(high[1] - low[1], tick)
+float overlapPts = math.max(0.0, math.min(high, high[1]) - math.max(low, low[1]))
+float overlapDen = math.max(math.min(thisRange, prevRange), tick)
+float barOverlap = not na(overlapPts) and not na(overlapDen) ? f_clamp(overlapPts / overlapDen, 0.0, 1.0) : na
+float avgOverlap = ta.sma(barOverlap, balanceLookback)
+
+// Rotation/chop is different from an organized balance. It looks for frequent
+// directional flips + overlap + poor net progress, without requiring clean,
+// stable range boundaries.
+float chg = close - close[1]
+float prevChg = close[1] - close[2]
+float flipHit = not na(chg) and not na(prevChg) and chg * prevChg < 0 ? 1.0 : 0.0
+float flipRate = ta.sma(flipHit, balanceLookback)
+
+float centralLo = obsLo + obsRange * 0.20
+float centralHi = obsHi - obsRange * 0.20
+float centerHit = not na(centralLo) and close >= centralLo and close <= centralHi ? 1.0 : 0.0
+float centerTime = ta.sma(centerHit, balanceLookback)
+
+bool balanceCandidate = not na(obsRange) and not na(auctionEfficiency) and not na(avgOverlap) and not na(centerTime) and
+     obsRange <= atr * balanceMaxRangeAtr and
+     auctionEfficiency <= balanceMaxEfficiency and
+     avgOverlap >= balanceMinOverlap and
+     centerTime >= balanceMinCenterTime
+
+bool rotationCandidate = not na(obsRange) and not na(auctionEfficiency) and not na(avgOverlap) and not na(flipRate) and
+     obsRange <= atr * chopMaxRangeAtr and
+     auctionEfficiency <= chopMaxEfficiency and
+     avgOverlap >= chopMinOverlap and
+     flipRate >= chopMinFlipRate
+
+var bool balanceActive = false
+var float activeBalanceHi = na
+var float activeBalanceLo = na
+var int balanceBuildCount = 0
+var int rotationBuildCount = 0
+var int balanceAboveCloses = 0
+var int balanceBelowCloses = 0
+var int lastBalanceExitDir = 0
+var int lastBalanceExitBar = na
+var string auctionStateText = "TRANSITION"
+
+if not balanceActive
+    balanceBuildCount := balanceCandidate ? balanceBuildCount + 1 : 0
+    if balanceBuildCount >= balanceConfirmBars
+        balanceActive := true
+        activeBalanceHi := obsHi
+        activeBalanceLo := obsLo
+        balanceAboveCloses := 0
+        balanceBelowCloses := 0
+        lastBalanceExitDir := 0
+        auctionStateText := "BALANCE"
+        registryRevision += 1
+else
+    float escapeBuf = math.max(tick * 2.0, atr * balanceEscapeAtr)
+    bool wickAbove = high > activeBalanceHi + escapeBuf
+    bool wickBelow = low < activeBalanceLo - escapeBuf
+    bool closeAbove = close > activeBalanceHi + escapeBuf
+    bool closeBelow = close < activeBalanceLo - escapeBuf
+
+    balanceAboveCloses := closeAbove ? balanceAboveCloses + 1 : close <= activeBalanceHi ? 0 : balanceAboveCloses
+    balanceBelowCloses := closeBelow ? balanceBelowCloses + 1 : close >= activeBalanceLo ? 0 : balanceBelowCloses
+
+    if closeAbove and balanceAboveCloses < balanceAcceptBars
+        auctionStateText := "TESTING UP"
+    else if closeBelow and balanceBelowCloses < balanceAcceptBars
+        auctionStateText := "TESTING DOWN"
+    else if wickAbove and close <= activeBalanceHi
+        auctionStateText := "FAILED UP"
+    else if wickBelow and close >= activeBalanceLo
+        auctionStateText := "FAILED DOWN"
+    else
+        auctionStateText := "BALANCE"
+
+    if balanceAboveCloses >= balanceAcceptBars
+        balanceActive := false
+        lastBalanceExitDir := 1
+        lastBalanceExitBar := bar_index
+        balanceBuildCount := 0
+        balanceAboveCloses := 0
+        balanceBelowCloses := 0
+        activeBalanceHi := na
+        activeBalanceLo := na
+        auctionStateText := "EXPANDING UP"
+        registryRevision += 1
+    else if balanceBelowCloses >= balanceAcceptBars
+        balanceActive := false
+        lastBalanceExitDir := -1
+        lastBalanceExitBar := bar_index
+        balanceBuildCount := 0
+        balanceAboveCloses := 0
+        balanceBelowCloses := 0
+        activeBalanceHi := na
+        activeBalanceLo := na
+        auctionStateText := "EXPANDING DOWN"
+        registryRevision += 1
+
+// Outside established balance, classify the auction without forcing a trend.
+// ROTATION / CHOP is explicitly separate from BALANCE: it means two-way noise
+// and poor net progress without sufficiently stable boundaries. A recent
+// accepted escape keeps EXPANDING only while directional progress persists.
+if not balanceActive
+    rotationBuildCount := rotationCandidate ? rotationBuildCount + 1 : 0
+    int sinceExit = na(lastBalanceExitBar) ? 1000000 : bar_index - lastBalanceExitBar
+    float lookbackMove = not na(close[balanceLookback]) ? close - close[balanceLookback] : na
+    bool expansionStillWorking = not na(auctionEfficiency) and auctionEfficiency >= 0.30 and not na(lookbackMove) and
+         ((lastBalanceExitDir > 0 and lookbackMove > 0) or (lastBalanceExitDir < 0 and lookbackMove < 0))
+
+    if rotationBuildCount >= chopConfirmBars
+        auctionStateText := "ROTATION / CHOP"
+    else if sinceExit <= 5 and lastBalanceExitDir != 0 and expansionStillWorking
+        auctionStateText := lastBalanceExitDir > 0 ? "EXPANDING UP" : "EXPANDING DOWN"
+    else if balanceBuildCount > 0
+        auctionStateText := "BUILDING BALANCE"
+    else if not na(auctionEfficiency) and auctionEfficiency >= 0.42 and not na(lookbackMove)
+        auctionStateText := lookbackMove > 0 ? "EXPANDING UP" : "EXPANDING DOWN"
+    else
+        auctionStateText := "TRANSITION"
+else
+    rotationBuildCount := 0
+
+int auctionStateCode = auctionStateText == "BALANCE" ? 1 :
+     auctionStateText == "BUILDING BALANCE" ? 2 :
+     auctionStateText == "TESTING UP" ? 3 :
+     auctionStateText == "TESTING DOWN" ? 4 :
+     auctionStateText == "FAILED UP" ? 5 :
+     auctionStateText == "FAILED DOWN" ? 6 :
+     auctionStateText == "EXPANDING UP" ? 7 :
+     auctionStateText == "EXPANDING DOWN" ? 8 :
+     auctionStateText == "ROTATION / CHOP" ? 9 : 10
+
+float balanceHi = balanceActive ? activeBalanceHi : na
+float balanceLo = balanceActive ? activeBalanceLo : na
+bool inBalance = balanceActive
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v0.4 INFORMATION-SHOCK / REPRICING CONTEXT
+//
+// This does not know the headline. It infers that the auction has changed
+// character when sustained displacement is paired with abnormal participation
+// or multiple meaningful mapped zones crossed.
+//
+// Controlled intraday state:
+// NORMAL -> SHOCK -> REPRICING -> STABILIZING -> NORMAL.
+// It may normalize during the day and hard-resets on a new day.
+// ─────────────────────────────────────────────────────────────────────────────
+int SH_NORMAL = 0
+int SH_SHOCK = 1
+int SH_REPRICING = 2
+int SH_STABILIZING = 3
+
+float shockVolBase = ta.sma(volume, shockVolLen)[1]
+float shockRelVol3 = not na(shockVolBase) and shockVolBase > 0 ?
+     (volume + nz(volume[1]) + nz(volume[2])) / (3.0 * shockVolBase) : 1.0
+
+bool clockReady3 = clockReady and clockReady[1] and clockReady[2]
+float shockClockRelVol3 = clockReady3 ? ta.sma(clockRelVol, 3) : shockRelVol3
+float shockPath3 = math.sum(math.abs(close - close[1]), 3)
+float shockDisp3 = not na(close[3]) ? math.abs(close - close[3]) : 0.0
+float shockDispAtr = shockDisp3 / math.max(atr, tick)
+float shockEfficiency3 = shockPath3 > tick ? shockDisp3 / shockPath3 : 0.0
+int shockDirNow = not na(close[3]) ? (close > close[3] ? 1 : close < close[3] ? -1 : 0) : 0
+
+int shockCrossedZones = 0
+if useContextSensors and array.size(zLo) > 0 and not na(close[3])
+    float moveLo = math.min(close[3], close)
+    float moveHi = math.max(close[3], close)
+    for sx = 0 to array.size(zLo) - 1
+        if array.get(zState, sx) != ST_CONSUMED and f_zoneStrength(sx) >= 3
+            float zm = f_mid(array.get(zLo, sx), array.get(zHi, sx))
+            if zm > moveLo and zm < moveHi
+                shockCrossedZones += 1
+
+bool shockDisplacementEvidence = useContextSensors and
+     shockDispAtr >= shockMinDispAtr and
+     shockEfficiency3 >= shockMinEfficiency
+
+bool shockParticipationEvidence = useContextSensors and
+     shockClockRelVol3 >= shockMinRelVol
+
+bool shockBattlefieldEvidence = useContextSensors and
+     shockCrossedZones >= shockMinZoneCrosses
+
+// Bit mask: 1 participation, 2 displacement, 4 battlefield/level crossing.
+int shockEvidenceNow =
+     (shockParticipationEvidence ? 1 : 0) +
+     (shockDisplacementEvidence ? 2 : 0) +
+     (shockBattlefieldEvidence ? 4 : 0)
+
+bool shockCandidate = shockDisplacementEvidence and
+     (shockParticipationEvidence or shockBattlefieldEvidence) and
+     shockDirNow != 0
+
+var int shockState = SH_NORMAL
+var int shockDirection = 0
+var int shockEvidence = 0
+var int shockStartBar = na
+var float shockOrigin = na
+var float shockExtreme = na
+var int shockStableBars = 0
+var int shockCountRth = 0
+var int shockExtremeBar = na
+var int shockImpulseBucketStored = 0
+
+if newDay
+    shockState := SH_NORMAL
+    shockDirection := 0
+    shockEvidence := 0
+    shockStartBar := na
+    shockOrigin := na
+    shockExtreme := na
+    shockStableBars := 0
+    shockCountRth := 0
+    shockExtremeBar := na
+    shockImpulseBucketStored := 0
+
+// Reset only the RTH episode COUNTER at the cash open.
+// Preserve any overnight shock state that is still controlling the auction.
+if rthStartedCtx
+    shockCountRth := 0
+
+if useContextSensors
+    bool sameShockCandidate = shockCandidate and shockState != SH_NORMAL and shockDirNow == shockDirection
+    bool oppositeShockCandidate = shockCandidate and shockState != SH_NORMAL and shockDirNow != shockDirection
+
+    if (shockState == SH_NORMAL and shockCandidate) or oppositeShockCandidate
+        shockState := SH_SHOCK
+        shockDirection := shockDirNow
+        shockEvidence := shockEvidenceNow
+        shockStartBar := bar_index
+        shockOrigin := close[3]
+        shockExtreme := close
+        shockStableBars := 0
+        if inRth
+            shockCountRth += 1
+        shockExtremeBar := bar_index
+        shockImpulseBucketStored := math.min(9, int(math.floor(shockDispAtr * 2.0)))
+
+    else
+        bool shockFreshProgress = shockDirection > 0 ? close > nz(shockExtreme, close) :
+             shockDirection < 0 ? close < nz(shockExtreme, close) : false
+        bool shockAuctionWorking = (shockDirection > 0 and auctionStateCode == 7) or
+             (shockDirection < 0 and auctionStateCode == 8)
+
+        if sameShockCandidate
+            shockEvidence := math.max(shockEvidence, shockEvidenceNow)
+            shockImpulseBucketStored := math.max(shockImpulseBucketStored,
+                 math.min(9, int(math.floor(shockDispAtr * 2.0))))
+            shockStableBars := 0
+
+            if shockFreshProgress
+                shockExtreme := shockDirection > 0 ? math.max(nz(shockExtreme, close), close) :
+                     math.min(nz(shockExtreme, close), close)
+                shockExtremeBar := bar_index
+                shockState := SH_REPRICING
+            else if shockState == SH_SHOCK and shockAuctionWorking
+                shockState := SH_REPRICING
+            else if shockState == SH_STABILIZING and shockAuctionWorking
+                shockState := SH_REPRICING
+
+        else if shockState == SH_SHOCK
+            if shockFreshProgress or shockAuctionWorking
+                shockState := SH_REPRICING
+                if shockFreshProgress
+                    shockExtreme := shockDirection > 0 ? math.max(nz(shockExtreme, close), close) :
+                         math.min(nz(shockExtreme, close), close)
+                    shockExtremeBar := bar_index
+                shockStableBars := 0
+            else if not na(shockStartBar) and bar_index > shockStartBar
+                shockState := SH_STABILIZING
+                shockStableBars := 1
+
+        else if shockState == SH_REPRICING
+            if shockFreshProgress
+                shockExtreme := shockDirection > 0 ? math.max(nz(shockExtreme, close), close) :
+                     math.min(nz(shockExtreme, close), close)
+                shockExtremeBar := bar_index
+                shockStableBars := 0
+            else if not shockAuctionWorking
+                shockState := SH_STABILIZING
+                shockStableBars := 1
+
+        else if shockState == SH_STABILIZING
+            bool resumed = shockFreshProgress and shockAuctionWorking
+
+            if resumed
+                shockState := SH_REPRICING
+                shockExtreme := close
+                shockExtremeBar := bar_index
+                shockStableBars := 0
+            else
+                bool clearlyNormalizing = auctionStateCode == 1 or auctionStateCode == 9
+                bool stillDirectional = auctionStateCode == 7 or auctionStateCode == 8
+                shockStableBars := stillDirectional ? 0 : shockStableBars + 1
+
+                if clearlyNormalizing or shockStableBars >= 3
+                    shockState := SH_NORMAL
+                    shockDirection := 0
+                    shockEvidence := 0
+                    shockStartBar := na
+                    shockOrigin := na
+                    shockExtreme := na
+                    shockStableBars := 0
+                    shockExtremeBar := na
+                    shockImpulseBucketStored := 0
+else
+    shockState := SH_NORMAL
+    shockDirection := 0
+    shockEvidence := 0
+    shockStartBar := na
+    shockOrigin := na
+    shockExtreme := na
+    shockStableBars := 0
+    shockExtremeBar := na
+    shockImpulseBucketStored := 0
+
+int shockAgeBucket = na(shockStartBar) ? 0 : math.min(9, math.max(0, bar_index - shockStartBar))
+int shockDirCode = shockDirection + 1  // DN=0, NONE=1, UP=2
+
+float shockLeg = not na(shockOrigin) and not na(shockExtreme) ? math.abs(shockExtreme - shockOrigin) : 0.0
+float shockRetraceFrac = shockLeg > tick ?
+     (shockDirection > 0 ? math.max(0.0, shockExtreme - close) / shockLeg :
+      shockDirection < 0 ? math.max(0.0, close - shockExtreme) / shockLeg : 0.0) : 0.0
+int shockRetraceBucket = shockState == SH_NORMAL ? 0 :
+     math.min(9, int(math.floor(math.min(0.999, shockRetraceFrac) * 10.0)))
+int shockExtremeAgeBucket = na(shockExtremeBar) ? 0 :
+     math.min(9, math.max(0, bar_index - shockExtremeBar))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIVERSAL NATIVE FOOTPRINT EYES
+// Raw/factual order-flow observations only. Interpretation belongs downstream.
+// This intentionally mirrors Option1 v2.0 BUS12 semantics for compatibility.
+// ─────────────────────────────────────────────────────────────────────────────
+footprint eyeFp = request.footprint(fpTicksPerRow, fpValueAreaPct, fpImbalancePct)
+bool eyeFpHas = useFootprint and not na(eyeFp)
+float eyeFpBuyVol = na
+float eyeFpSellVol = na
+float eyeFpTotalVol = na
+float eyeFpDelta = na
+float eyeFpDeltaPct = na
+float eyeFpPoc = na
+float eyeFpVah = na
+float eyeFpVal = na
+float eyeFpValueMid = na
+float eyeFpUpperDelta = 0.0
+float eyeFpLowerDelta = 0.0
+int eyeFpBuyImb = 0
+int eyeFpSellImb = 0
+int eyeFpMaxBuyStack = 0
+int eyeFpMaxSellStack = 0
+int eyeFpTopBuyImb = 0
+int eyeFpTopSellImb = 0
+int eyeFpBottomBuyImb = 0
+int eyeFpBottomSellImb = 0
+float eyeFpTopDelta = 0.0
+float eyeFpBottomDelta = 0.0
+
+if eyeFpHas
+    eyeFpBuyVol := eyeFp.buy_volume()
+    eyeFpSellVol := eyeFp.sell_volume()
+    eyeFpTotalVol := eyeFp.total_volume()
+    eyeFpDelta := eyeFp.delta()
+    eyeFpDeltaPct := eyeFpTotalVol > 0 ? eyeFpDelta / eyeFpTotalVol : 0.0
+
+    volume_row eyePocRow = eyeFp.poc()
+    volume_row eyeVahRow = eyeFp.vah()
+    volume_row eyeValRow = eyeFp.val()
+    eyeFpPoc := math.avg(eyePocRow.up_price(), eyePocRow.down_price())
+    eyeFpVah := eyeVahRow.up_price()
+    eyeFpVal := eyeValRow.down_price()
+    eyeFpValueMid := math.avg(eyeFpVah, eyeFpVal)
+
+    array<volume_row> eyeRows = eyeFp.rows()
+    int eyeBuyRun = 0
+    int eyeSellRun = 0
+    float eyeBarMid = math.avg(high, low)
+    float eyeRangeForRows = math.max(high - low, tick)
+    float eyeTopCut = low + eyeRangeForRows * 0.67
+    float eyeBottomCut = low + eyeRangeForRows * 0.33
+    for eyeRow in eyeRows
+        bool eyeBuyImb = eyeRow.has_buy_imbalance()
+        bool eyeSellImb = eyeRow.has_sell_imbalance()
+        float eyeRowMid = math.avg(eyeRow.up_price(), eyeRow.down_price())
+        float eyeRowDelta = eyeRow.delta()
+
+        if eyeRowMid >= eyeTopCut
+            eyeFpTopDelta += eyeRowDelta
+            if eyeBuyImb
+                eyeFpTopBuyImb += 1
+            if eyeSellImb
+                eyeFpTopSellImb += 1
+        else if eyeRowMid <= eyeBottomCut
+            eyeFpBottomDelta += eyeRowDelta
+            if eyeBuyImb
+                eyeFpBottomBuyImb += 1
+            if eyeSellImb
+                eyeFpBottomSellImb += 1
+
+        if eyeRowMid >= eyeBarMid
+            eyeFpUpperDelta += eyeRowDelta
+        else
+            eyeFpLowerDelta += eyeRowDelta
+
+        if eyeBuyImb
+            eyeFpBuyImb += 1
+            eyeBuyRun += 1
+            eyeFpMaxBuyStack := math.max(eyeFpMaxBuyStack, eyeBuyRun)
+        else
+            eyeBuyRun := 0
+
+        if eyeSellImb
+            eyeFpSellImb += 1
+            eyeSellRun += 1
+            eyeFpMaxSellStack := math.max(eyeFpMaxSellStack, eyeSellRun)
+        else
+            eyeSellRun := 0
+
+bool eyeFpPocUp = eyeFpHas and not na(eyeFpPoc[1]) and eyeFpPoc > eyeFpPoc[1] + tick
+bool eyeFpPocDown = eyeFpHas and not na(eyeFpPoc[1]) and eyeFpPoc < eyeFpPoc[1] - tick
+bool eyeFpValueUp = eyeFpHas and not na(eyeFpValueMid[1]) and eyeFpValueMid > eyeFpValueMid[1] + tick
+bool eyeFpValueDown = eyeFpHas and not na(eyeFpValueMid[1]) and eyeFpValueMid < eyeFpValueMid[1] - tick
+
+float eyeBarRange = math.max(high - low, tick)
+float eyeCloseLoc = ((close - low) - (high - close)) / eyeBarRange
+float eyeUpperWickFrac = (high - math.max(open, close)) / eyeBarRange
+float eyeLowerWickFrac = (math.min(open, close) - low) / eyeBarRange
+bool eyeFpAggBuy = eyeFpHas and eyeFpDeltaPct >= fpStrongDeltaPct
+bool eyeFpAggSell = eyeFpHas and eyeFpDeltaPct <= -fpStrongDeltaPct
+
+// Observational absorption-like facts, NOT directional votes.
+bool eyeSellerAbsorptionFact = eyeFpHas and eyeFpAggSell and
+     (eyeCloseLoc >= -0.10 or eyeLowerWickFrac >= 0.32) and eyeFpLowerDelta < 0
+bool eyeBuyerAbsorptionFact = eyeFpHas and eyeFpAggBuy and
+     (eyeCloseLoc <= 0.10 or eyeUpperWickFrac >= 0.32) and eyeFpUpperDelta > 0
+
+f_eyeSignCode(float x) =>
+    x > 0 ? 2 : x < 0 ? 0 : 1
+
+f_eyeDeltaCode(float x) =>
+    na(x) ? 10 : math.min(20, math.max(0, int(math.round(x / 0.05)) + 10))
+
+float eyePocPos = eyeFpHas ? (eyeFpPoc - low) / eyeBarRange : na
+int eyePocLocCode = not eyeFpHas ? 0 :
+     eyePocPos < 0.25 ? 1 : eyePocPos < 0.50 ? 2 : eyePocPos < 0.75 ? 3 : 4
+
+// v1.4 row-location / impact facts. These are deliberately descriptive.
+// "Poor impact" means aggressive volume was concentrated near an extreme but
+// price did not achieve the expected same-direction close/result.
+// "Acceptance" means aggression, row imbalance, POC location and close result
+// all agree that price is being accepted through the bar rather than rejected.
+bool eyeTopBuyPoorImpact = eyeFpHas and eyeFpAggBuy and eyeFpTopDelta > 0 and
+     (eyeCloseLoc <= 0.10 or eyeUpperWickFrac >= 0.28)
+bool eyeBottomSellPoorImpact = eyeFpHas and eyeFpAggSell and eyeFpBottomDelta < 0 and
+     (eyeCloseLoc >= -0.10 or eyeLowerWickFrac >= 0.28)
+bool eyeTopBuyAcceptance = eyeFpHas and eyeFpAggBuy and eyeFpTopBuyImb > 0 and
+     eyePocPos >= 0.55 and eyeCloseLoc >= 0.35
+bool eyeBottomSellAcceptance = eyeFpHas and eyeFpAggSell and eyeFpBottomSellImb > 0 and
+     eyePocPos <= 0.45 and eyeCloseLoc <= -0.35
+
+// BUS22 signature 53. Row-location footprint facts only.
+// Decode in reverse order in Bot2.
+int microRowBusInt = 53
+microRowBusInt := microRowBusInt * 8 + math.min(7, eyeFpTopBuyImb)
+microRowBusInt := microRowBusInt * 8 + math.min(7, eyeFpTopSellImb)
+microRowBusInt := microRowBusInt * 8 + math.min(7, eyeFpBottomBuyImb)
+microRowBusInt := microRowBusInt * 8 + math.min(7, eyeFpBottomSellImb)
+microRowBusInt := microRowBusInt * 3 + f_eyeSignCode(eyeFpTopDelta)
+microRowBusInt := microRowBusInt * 3 + f_eyeSignCode(eyeFpBottomDelta)
+microRowBusInt := microRowBusInt * 2 + (eyeTopBuyPoorImpact ? 1 : 0)
+microRowBusInt := microRowBusInt * 2 + (eyeBottomSellPoorImpact ? 1 : 0)
+microRowBusInt := microRowBusInt * 2 + (eyeTopBuyAcceptance ? 1 : 0)
+microRowBusInt := microRowBusInt * 2 + (eyeBottomSellAcceptance ? 1 : 0)
+float microRowBus = float(microRowBusInt)
+
+// BUS12 exact Option1-v2 compatible packing.
+int fpEyeBusInt = 21
+fpEyeBusInt := fpEyeBusInt * 2 + (eyeFpHas ? 1 : 0)
+fpEyeBusInt := fpEyeBusInt * 21 + f_eyeDeltaCode(eyeFpDeltaPct)
+fpEyeBusInt := fpEyeBusInt * 3 + (eyeFpPocUp ? 2 : eyeFpPocDown ? 0 : 1)
+fpEyeBusInt := fpEyeBusInt * 3 + (eyeFpValueUp ? 2 : eyeFpValueDown ? 0 : 1)
+fpEyeBusInt := fpEyeBusInt * 8 + math.min(7, eyeFpMaxBuyStack)
+fpEyeBusInt := fpEyeBusInt * 8 + math.min(7, eyeFpMaxSellStack)
+fpEyeBusInt := fpEyeBusInt * 8 + math.min(7, eyeFpBuyImb)
+fpEyeBusInt := fpEyeBusInt * 8 + math.min(7, eyeFpSellImb)
+fpEyeBusInt := fpEyeBusInt * 2 + (eyeSellerAbsorptionFact ? 1 : 0)
+fpEyeBusInt := fpEyeBusInt * 2 + (eyeBuyerAbsorptionFact ? 1 : 0)
+fpEyeBusInt := fpEyeBusInt * 3 + f_eyeSignCode(eyeFpUpperDelta)
+fpEyeBusInt := fpEyeBusInt * 3 + f_eyeSignCode(eyeFpLowerDelta)
+fpEyeBusInt := fpEyeBusInt * 5 + eyePocLocCode
+float fpEyeBus = float(fpEyeBusInt)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.1 SENSOR PRESERVATION / UNKNOWN-AWARENESS TELEMETRY
+// Additive only: downstream brains can choose to ignore BUS16–19 completely.
+// The purpose is to stop "missing" evidence from being silently confused with
+// neutral evidence, and to preserve raw footprint facts that BUS12 compresses.
+// ─────────────────────────────────────────────────────────────────────────────
+bool eyeBenchmarkHas = useCrossMarketContext and not na(esCloseCtx)
+bool eyeVixHas = useCrossMarketContext and not na(vixCloseCtx) and not na(vixPrevDaily)
+bool eyeMapHasR = not na(r1Center)
+bool eyeMapHasS = not na(s1Center)
+
+// BUS16 mixed-radix availability code. Decode in reverse order.
+// Signature 31 protects against accidentally wiring an unrelated plot.
+// Fields: profile(1 futures/2 equity), footprint enabled, footprint available,
+// cross-market enabled, benchmark available, VIX available, clock ready, RTH,
+// nearest resistance available, nearest support available.
+int sensorBusInt = 31
+sensorBusInt := sensorBusInt * 3 + (profileIsFutures ? 1 : 2)
+sensorBusInt := sensorBusInt * 2 + (useFootprint ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (eyeFpHas ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (useCrossMarketContext ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (eyeBenchmarkHas ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (eyeVixHas ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (clockReady ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (inRth ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (eyeMapHasR ? 1 : 0)
+sensorBusInt := sensorBusInt * 2 + (eyeMapHasS ? 1 : 0)
+float sensorBus = float(sensorBusInt)
+
+// Raw research facts. BUS12 remains the compact compatibility bus.
+// These preserve information that the compact code/midpoint intentionally loses.
+float rawFpDeltaFracBus = eyeFpHas ? eyeFpDeltaPct : na
+float rawFpVahBus = eyeFpHas ? eyeFpVah : na
+float rawFpValBus = eyeFpHas ? eyeFpVal : na
+
+// BUS10 v3 — auction/environment context, exact mixed-radix packing.
+int contextBusInt = 8
+contextBusInt := contextBusInt * 4 + shockState
+contextBusInt := contextBusInt * 3 + shockDirCode
+contextBusInt := contextBusInt * 8 + shockEvidence
+contextBusInt := contextBusInt * 10 + shockAgeBucket
+contextBusInt := contextBusInt * 10 + shockImpulseBucketStored
+contextBusInt := contextBusInt * 10 + shockRetraceBucket
+contextBusInt := contextBusInt * 10 + shockExtremeAgeBucket
+contextBusInt := contextBusInt * 6 + openLocationCode
+contextBusInt := contextBusInt * 6 + gapCode
+contextBusInt := contextBusInt * 8 + openingAuctionCode
+contextBusInt := contextBusInt * 4 + openingRangeCode
+contextBusInt := contextBusInt * 10 + r1BattleCode
+contextBusInt := contextBusInt * 10 + s1BattleCode
+contextBusInt := contextBusInt * 10 + r1ReactionCode
+contextBusInt := contextBusInt * 10 + s1ReactionCode
+contextBusInt := contextBusInt * 6 + weekdayCode
+float contextBus = float(contextBusInt)
+
+// BUS11 — market clock + calendar + cross-market context.
+// Ratios are sent at 0.1x resolution, capped at 3.1x+.
+int clockBusInt = 7
+clockBusInt := clockBusInt * 79 + rthSlotCode
+clockBusInt := clockBusInt * 2 + (clockReady ? 1 : 0)
+clockBusInt := clockBusInt * 32 + f_ratioCode(clockRelVol)
+clockBusInt := clockBusInt * 32 + f_ratioCode(clockRelRange)
+clockBusInt := clockBusInt * 32 + f_ratioCode(clockRelEfficiency)
+clockBusInt := clockBusInt * 32 + f_ratioCode(clockVolumePace)
+clockBusInt := clockBusInt * 32 + f_ratioCode(clockRangePace)
+clockBusInt := clockBusInt * 3 + calendarCode
+clockBusInt := clockBusInt * 6 + esContextCode
+clockBusInt := clockBusInt * 4 + vixLevelCode
+clockBusInt := clockBusInt * 6 + vixMoveCode
+clockBusInt := clockBusInt * 10 + math.min(9, shockCountRth)
+float clockBus = float(clockBusInt)
+
+// Exposed map version: increment only when the battlefield Bot2 can actually
+// observe changes. Internal registry churn that does not alter R1/R2/S1/S2,
+// their metadata, balance boundaries, or auction state does NOT bump the bus.
+var float prevR1Center = na
+var float prevR2Center = na
+var float prevS1Center = na
+var float prevS2Center = na
+var float prevR1Meta = na
+var float prevS1Meta = na
+var float prevBalHi = na
+var float prevBalLo = na
+var int prevAuctionStateCode = na
+
+f_seriesChanged(float a, float b) =>
+    (na(a) and not na(b)) or (not na(a) and na(b)) or (not na(a) and not na(b) and math.abs(a - b) > tick * 0.25)
+
+bool exposedMapChanged = f_seriesChanged(r1Center, prevR1Center) or f_seriesChanged(r2Center, prevR2Center) or
+     f_seriesChanged(s1Center, prevS1Center) or f_seriesChanged(s2Center, prevS2Center) or
+     f_seriesChanged(r1Meta, prevR1Meta) or f_seriesChanged(s1Meta, prevS1Meta) or
+     f_seriesChanged(balanceHi, prevBalHi) or f_seriesChanged(balanceLo, prevBalLo) or
+     (not na(prevAuctionStateCode) and auctionStateCode != prevAuctionStateCode)
+
+if exposedMapChanged
+    mapVersion += 1
+
+prevR1Center := r1Center
+prevR2Center := r2Center
+prevS1Center := s1Center
+prevS2Center := s2Center
+prevR1Meta := r1Meta
+prevS1Meta := s1Meta
+prevBalHi := balanceHi
+prevBalLo := balanceLo
+prevAuctionStateCode := auctionStateCode
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIVERSAL EYES COMPACT BUS — hidden plots for either downstream brain.
+// BUS1–11 = frozen Bot1 compatibility. BUS12–15 = Option1 v2 factual flow/value.
+// BUS16–19 = additive v1.1 sensor-quality/raw-footprint research telemetry.
+// BUS20 = additive v1.2 NQ/benchmark leadership-vs-opposition detail.
+// BUS21 = additive v1.3 completed-HTF displacement/efficiency/location facts.
+// ─────────────────────────────────────────────────────────────────────────────
+// BUS 1 packs map version + auction state in the hundredths.
+// Bot2: version=floor(header), state=round((header-floor(header))*100).
+float mapHeader = float(mapVersion) + float(auctionStateCode) / 100.0
+plot(mapHeader, "BUS 1 — Map Header (Version + Auction State)", display=display.none)
+plot(r1Center, "BUS 2 — Resistance 1 Center", display=display.none)
+plot(r1Meta, "BUS 3 — Resistance 1 Meta", display=display.none)
+plot(r2Center, "BUS 4 — Resistance 2 / Next Destination", display=display.none)
+plot(s1Center, "BUS 5 — Support 1 Center", display=display.none)
+plot(s1Meta, "BUS 6 — Support 1 Meta", display=display.none)
+plot(s2Center, "BUS 7 — Support 2 / Next Destination", display=display.none)
+plot(balanceHi, "BUS 8 — Current Balance High", display=display.none)
+plot(balanceLo, "BUS 9 — Current Balance Low", display=display.none)
+plot(contextBus, "BUS 10 — Auction Context v3", display=display.none)
+plot(clockBus, "BUS 11 — Market Clock + Cross-Market", display=display.none)
+plot(fpEyeBus, "BUS 12 — Footprint Eyes Context", display=display.none)
+plot(eyeFpPoc, "BUS 13 — Footprint POC", display=display.none)
+plot(eyeFpValueMid, "BUS 14 — Footprint Value Mid", display=display.none)
+plot(eyeRthVwap, "BUS 15 — RTH VWAP", display=display.none)
+plot(sensorBus, "BUS 16 — Sensor Availability v1", display=display.none)
+plot(rawFpDeltaFracBus, "BUS 17 — Footprint Delta Fraction RAW", display=display.none)
+plot(rawFpVahBus, "BUS 18 — Footprint VAH RAW", display=display.none)
+plot(rawFpValBus, "BUS 19 — Footprint VAL RAW", display=display.none)
+plot(crossDetailBus, "BUS 20 — Cross-Market Detail v2", display=display.none)
+plot(multiHtfBus, "BUS 21 — Multi-Horizon Facts v1", display=display.none)
+plot(microRowBus, "BUS 22 — Footprint Row Microstructure v1", display=display.none)
+plot(flowBus, "BUS 23 — Lead-Lag + RTH Flow Facts v1", display=display.none)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL LAYER — intentionally sparse
+// ─────────────────────────────────────────────────────────────────────────────
+var box[] visBoxes = array.new_box()
+var label[] visLabels = array.new_label()
+
+f_clearVisuals() =>
+    while array.size(visBoxes) > 0
+        box.delete(array.pop(visBoxes))
+    while array.size(visLabels) > 0
+        label.delete(array.pop(visLabels))
+
+f_drawZone(int idx, bool resistance) =>
+    if idx >= 0
+        float lo = array.get(zLo, idx)
+        float hi = array.get(zHi, idx)
+        float center = f_mid(lo, hi)
+        float distAtr = math.abs(center - close) / math.max(atr, tick)
+        int strength = f_zoneStrength(idx)
+        if strength >= minVisibleStrength and distAtr <= visibleRadiusAtr
+            int src = array.get(zSource, idx)
+            int st = array.get(zState, idx)
+            color baseColor = resistance ? color.red : color.lime
+            int alpha = strength >= 9 ? 78 : strength >= 7 ? 83 : 88
+            box b = box.new(bar_index, hi, bar_index + projectionBars, lo,
+                 xloc=xloc.bar_index, border_color=color.new(baseColor, 35),
+                 bgcolor=color.new(baseColor, alpha))
+            array.push(visBoxes, b)
+            if showLabels
+                string txt = (resistance ? "R" : "S") + " · " + f_srcText(src) + " · " + f_stateText(st) + " · " + str.tostring(strength)
+                label lb = label.new(bar_index + projectionBars, center, txt,
+                     xloc=xloc.bar_index, style=label.style_label_left,
+                     color=color.new(baseColor, 80), textcolor=color.white, size=size.tiny)
+                array.push(visLabels, lb)
+
+if barstate.islast
+    f_clearVisuals()
+    if displayMode == "NORMAL"
+        // Draw nearest and next zones only. Never dump the full registry.
+        f_drawZone(r1, true)
+        f_drawZone(r2, true)
+        f_drawZone(s1, false)
+        f_drawZone(s2, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 19, border_width=1, frame_color=color.new(color.gray, 55), border_color=color.new(color.gray, 60))
+color dashHdrBg = color.new(color.blue, 15)
+color dashLblBg = color.new(color.black, 12)
+color dashValBg = color.new(color.black, 25)
+color dashTxt = color.white
+color dashSubTxt = color.new(color.white, 0)
+
+f_fmt(float x) =>
+    na(x) ? "—" : str.tostring(x, format.mintick)
+
+if barstate.islast
+    if showDashboard and displayMode == "NORMAL"
+        table.cell(dash, 0, 0, "UNIVERSAL EYES", text_color=dashTxt, bgcolor=dashHdrBg)
+        table.cell(dash, 1, 0, "v1.4 · " + profileText, text_color=dashTxt, bgcolor=dashHdrBg)
+        table.cell(dash, 0, 1, "Symbol / type", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 1, syminfo.ticker + " · " + syminfo.type, text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 2, "Registry / map", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 2, str.tostring(array.size(zLo)) + " / " + str.tostring(mapVersion), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 3, "R1 / R2", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 3, f_fmt(r1Center) + " / " + f_fmt(r2Center), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 4, "S1 / S2", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 4, f_fmt(s1Center) + " / " + f_fmt(s2Center), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 5, "Auction", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 5, auctionStateText, text_color=dashTxt, bgcolor=dashValBg)
+        string shockTxt = shockState == SH_SHOCK ? "SHOCK" : shockState == SH_REPRICING ? "REPRICING" : shockState == SH_STABILIZING ? "STABILIZING" : "NORMAL"
+        string shockDirTxt = shockDirection > 0 ? " UP" : shockDirection < 0 ? " DN" : ""
+        table.cell(dash, 0, 6, "Context", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 6, shockTxt + shockDirTxt, text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 7, "R1/S1 battle", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 7, str.tostring(r1BattleCode) + " / " + str.tostring(s1BattleCode), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 8, "Shock life", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 8, "I" + str.tostring(shockImpulseBucketStored) + " R" + str.tostring(shockRetraceBucket) + " X" + str.tostring(shockExtremeAgeBucket), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 9, "Open ctx", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 9, "L" + str.tostring(openLocationCode) + " G" + str.tostring(gapCode) + " A" + str.tostring(openingAuctionCode) + " O" + str.tostring(openingRangeCode), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 10, "Clock", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 10, "D" + str.tostring(weekdayCode) + " S" + str.tostring(rthSlotCode) + " V" + str.tostring(clockRelVol, "#.1") + " R" + str.tostring(clockRelRange, "#.1"), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 11, "Benchmark / VIX", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 11, "BM" + str.tostring(esContextCode) + " VX" + str.tostring(vixLevelCode) + "." + str.tostring(vixMoveCode) + " C" + str.tostring(calendarCode), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 12, "Footprint", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 12, eyeFpHas ? "D " + str.tostring(eyeFpDeltaPct, "#.##") + " I " + str.tostring(eyeFpBuyImb) + "/" + str.tostring(eyeFpSellImb) : "NO DATA", text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 13, "FP migration", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 13, (eyeFpPocUp ? "POC UP" : eyeFpPocDown ? "POC DN" : "POC FLAT") + " · " + (eyeFpValueUp ? "VAL UP" : eyeFpValueDown ? "VAL DN" : "VAL FLAT"), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 14, "Absorption facts", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 14, (eyeSellerAbsorptionFact ? "SELL ABS" : "—") + " / " + (eyeBuyerAbsorptionFact ? "BUY ABS" : "—"), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 15, "RTH VWAP", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 15, f_fmt(eyeRthVwap), text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 16, "Session profile", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 16, profileIsFutures ? "ASIA / LONDON / RTH" : "AH / PRE / RTH", text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 17, "BUS contract", text_color=dashSubTxt, bgcolor=dashLblBg)
+        table.cell(dash, 1, 17, "1–11 Bot1 · 12–19 FP · 20 XD · 21 HTF · 22 MICRO · 23 FLOW", text_color=dashTxt, bgcolor=dashValBg)
+        table.cell(dash, 0, 18, "Sensor availability", text_color=dashSubTxt, bgcolor=dashLblBg)
+        string sensorTxt = "FP " + (eyeFpHas ? "Y" : "N") + " · BM " + (eyeBenchmarkHas ? "Y" : "N") + " · VX " + (eyeVixHas ? "Y" : "N") + " · CLK " + (clockReady ? "Y" : "N")
+        table.cell(dash, 1, 18, sensorTxt, text_color=dashTxt, bgcolor=dashValBg)
+    else
+        for rr = 0 to 18
+            table.cell(dash, 0, rr, "", bgcolor=color.new(color.black, 100))
+            table.cell(dash, 1, rr, "", bgcolor=color.new(color.black, 100))
+
+// Optional current-balance shading only in NORMAL mode.
+pBalHi = plot(displayMode == "NORMAL" ? balanceHi : na, "Current Balance High", color=color.new(color.yellow, 40), linewidth=1, style=plot.style_linebr)
+pBalLo = plot(displayMode == "NORMAL" ? balanceLo : na, "Current Balance Low", color=color.new(color.yellow, 40), linewidth=1, style=plot.style_linebr)
+fill(pBalHi, pBalLo, color=color.new(color.yellow, 92), title="Current Balance")
+
+// End Asads Universal Market Eyes v1.4 MICROSTRUCTURE + FLOW FACTS

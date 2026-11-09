@@ -1,0 +1,1799 @@
+//@version=6
+strategy(
+     "Asads QQQ Reaction Scalper V1.10A — Reaction Failure Stop",
+     overlay = true,
+     pyramiding = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick = true,
+     calc_on_order_fills = false,
+     use_bar_magnifier = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0,
+     max_labels_count = 500,
+     max_lines_count = 500)
+
+// ============================================================================
+// ASADS QQQ REACTION SCALPER V1.10A — REACTION FAILURE STOP
+// HOST CHART: QQQ 5 MINUTES
+//
+// PRIMARY GOALS:
+// 1) HIGH WIN RATE
+// 2) HIGH TRADE FREQUENCY
+// Profit factor is recorded by TradingView but is NOT the optimization target.
+//
+// CORE HYPOTHESIS:
+// - Two or more INDEPENDENT historical rejection events around the same price
+//   establish a horizontal support/resistance ZONE.
+// - A later 5m candle revisits that zone.
+// - We WAIT FOR THAT 5m CANDLE TO CONFIRM/CLOSE.
+// - If it rejected the zone, ARM the setup but do not trade yet.
+// - Require a small favorable move AFTER the close before actual entry.
+// - calc_on_order_fills stays OFF; confirmation is modeled with stop-entry orders.
+// - Capture ONLY the immediate post-confirmation reaction and leave.
+//
+// IMPORTANT ARCHITECTURE:
+// - Few HARD entry gates.
+// - Many SOFT confidence features.
+// - Confidence primarily controls HOW MUCH reaction we demand and how long we
+//   allow the trade to remain open.
+// - No battle-zone engine, no role-reversal/flip engine, no giant score wall.
+// - V1.1 adds obvious PDH/PDL, PMH/PML and Opening-Range H/L as primary
+//   reaction candidates so frequency is not limited only by learned 2-touch levels.
+// - All higher-timeframe lookahead_on requests are removed.
+// - LONG/SHORT alert markers plus Entry/Target/Stop/Exit drawings are explicit.
+// - V1.10A REACTION-FAILURE STOP TEST:
+//   V1.9's reaction detection, +$0.01 confirmation, 26-year setup filters,
+//   1-2 cent economic targets, confirmation window and automation behavior are
+//   UNCHANGED.
+//   Deep research on the complete V1.9 export found the main economic weakness:
+//   most losing trades make almost no additional favorable progress after entry,
+//   yet V1.9 allows them to travel to much wider structural stops.
+//   V1.10A adds a NORMAL reaction-failure stop:
+//       default = $0.01 adverse from the planned confirmed-entry price.
+//   The original structural stop remains calculated as catastrophic context.
+//   The executable stop is whichever is CLOSER to the entry.
+//   This is the exact TradingView test of the strongest CSV counterfactual.
+//   Objective: durable PnL + PF + low DD + high frequency, not maximum win rate.
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. SESSION
+// ─────────────────────────────────────────────────────────────────────────────
+groupSession = "1. Session"
+
+string sessionTZ = "America/New_York"
+tradeSession = input.session("0935-1555", "Trading Window (ET)", group = groupSession)
+
+tradeMonday = input.bool(true, "Monday", group = groupSession)
+tradeTuesday = input.bool(true, "Tuesday", group = groupSession)
+tradeWednesday = input.bool(true, "Wednesday", group = groupSession)
+tradeThursday = input.bool(true, "Thursday", group = groupSession)
+tradeFriday = input.bool(true, "Friday", group = groupSession)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. HISTORICAL REACTION LEVELS
+// ─────────────────────────────────────────────────────────────────────────────
+groupLevel = "2. Historical Reaction Levels"
+
+atrLen = input.int(14, "ATR Length", minval = 2, group = groupLevel)
+
+pivotLeft = input.int(2, "Pivot Left Bars", minval = 1, maxval = 8, group = groupLevel)
+pivotRight = input.int(2, "Pivot Right Bars", minval = 1, maxval = 8, group = groupLevel)
+
+minTouches = input.int(2, "Independent Rejections Needed", minval = 2, maxval = 5, group = groupLevel)
+minTouchSeparation = input.int(3, "Minimum Bars Between Rejections", minval = 2, maxval = 30, group = groupLevel)
+
+formationDepartureATR = input.float(0.20, "Minimum Departure After Historical Touch (ATR)", minval = 0.05, step = 0.05, group = groupLevel)
+mergeRadiusATR = input.float(0.12, "Same-Level Merge Radius (ATR)", minval = 0.03, step = 0.01, group = groupLevel)
+
+zoneHalfATR = input.float(0.07, "Level Zone Half-Width (ATR)", minval = 0.02, step = 0.01, group = groupLevel)
+maxLevelAgeBars = input.int(780, "Maximum Learned-Level Age (5m Bars)", minval = 30, maxval = 2000, group = groupLevel)
+breakDistanceATR = input.float(0.12, "Confirmed Close Beyond Level Invalidates It (ATR)", minval = 0.03, step = 0.01, group = groupLevel)
+
+maxStoredLevels = input.int(64, "Maximum Stored Levels", minval = 12, maxval = 100, group = groupLevel)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. CURRENT REACTION — HARD GATES
+// ─────────────────────────────────────────────────────────────────────────────
+groupReaction = "3. Current Reaction"
+
+touchAllowanceATR = input.float(0.04, "Touch Allowance Outside Zone (ATR)", minval = 0.00, step = 0.01, group = groupReaction)
+maxPierceATR = input.float(0.24, "Maximum Intrabar Pierce Beyond Zone (ATR)", minval = 0.04, step = 0.01, group = groupReaction)
+minRejectionDisplacementATR = input.float(0.06, "Minimum High/Low-To-Close Rejection (ATR)", minval = 0.02, step = 0.01, group = groupReaction)
+reclaimATR = input.float(0.00, "Close Must Reclaim Level By (ATR)", minval = 0.00, step = 0.01, group = groupReaction)
+
+requireDirectionalBody = input.bool(false, "Require Bullish CALL / Bearish PUT Body", group = groupReaction)
+maxStructureRiskATR = input.float(0.55, "Skip If Structural Stop Wider Than ATR", minval = 0.10, step = 0.05, group = groupReaction)
+
+entryCooldownBars = input.int(0, "Bars Between New Signals", minval = 0, maxval = 20, group = groupReaction)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. SOFT CONFIDENCE FEATURES
+// These do NOT block normal valid reactions.
+// ─────────────────────────────────────────────────────────────────────────────
+groupConfidence = "4. Adaptive Confidence"
+
+freshBars1 = input.int(78, "Fresh Level Window (5m Bars)", minval = 20, maxval = 300, group = groupConfidence)
+freshBars2 = input.int(156, "Medium-Fresh Window (5m Bars)", minval = 40, maxval = 600, group = groupConfidence)
+
+strongThreshold = input.int(62, "STRONG Confidence Threshold", minval = 40, maxval = 90, group = groupConfidence)
+aPlusThreshold = input.int(78, "A+ Confidence Threshold", minval = 50, maxval = 98, group = groupConfidence)
+
+volumeSlotLookback = input.int(20, "Same-Time Volume EMA Days", minval = 5, maxval = 60, group = groupConfidence)
+approachBars = input.int(3, "Approach Momentum Bars", minval = 1, maxval = 8, group = groupConfidence)
+
+// Classic references are CONFLUENCE ONLY.
+usePD = input.bool(true, "Use PDH/PDL Confluence", group = groupConfidence)
+usePM = input.bool(true, "Use PMH/PML Confluence", group = groupConfidence)
+useOR = input.bool(true, "Use Opening Range Confluence", group = groupConfidence)
+useVWAP = input.bool(true, "Use VWAP Confluence", group = groupConfidence)
+confluenceATR = input.float(0.12, "Classic-Level Confluence Radius (ATR)", minval = 0.02, step = 0.01, group = groupConfidence)
+
+tradeClassicLevels = input.bool(true, "Trade PD / PM / Opening Range As Reaction Levels", group = groupConfidence,
+     tooltip = "Adds obvious market reference levels as primary reaction candidates. VWAP remains confluence-only.")
+classicZoneHalfATR = input.float(0.055, "Classic Reaction Zone Half-Width (ATR)", minval = 0.01, step = 0.005, group = groupConfidence)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. ADAPTIVE REACTION TARGETS / EXIT
+// NO FIXED RR. Structural stop and reaction target are independent.
+// ─────────────────────────────────────────────────────────────────────────────
+groupExit = "5. Reaction Exit"
+
+confirmationUSD = input.float(0.01, "Favorable Move Required Before Entry ($)", minval = 0.01, step = 0.01, group = groupExit,
+     tooltip = "UNCHANGED from V1.9. The rejection close only ARMS the setup. Actual entry requires this much favorable QQQ movement after that close.")
+
+useReactionFailureStop = input.bool(true, "Use Reaction-Failure Stop", group = groupExit,
+     tooltip = "Primary V1.10A change. Exit when the confirmed reaction gives this distance back instead of waiting for the wider structural stop.")
+reactionFailureUSD = input.float(0.01, "Reaction-Failure Distance ($)", minval = 0.01, step = 0.01, group = groupExit,
+     tooltip = "Primary research test = $0.01. Predeclared fallback if needed = $0.02.")
+
+useEconomicTarget = input.bool(true, "Use Structural-Risk Economic Target", group = groupExit,
+     tooltip = "When ON, target size scales modestly with the original structural risk instead of always demanding exactly one cent.")
+economicTargetR = input.float(0.10, "Target As Fraction Of Structural Risk", minval = 0.02, maxval = 0.50, step = 0.01, group = groupExit,
+     tooltip = "0.10 means aim for roughly 10% of planned stop distance. With a 90% win-rate goal, this is near the minimum economically sensible zone before costs.")
+economicTargetMinUSD = input.float(0.01, "Minimum Target ($)", minval = 0.01, step = 0.01, group = groupExit)
+economicTargetMaxUSD = input.float(0.02, "Maximum Target ($)", minval = 0.01, step = 0.01, group = groupExit,
+     tooltip = "V1.9 deliberately caps the first experiment at 2 cents to avoid a large win-rate shock.")
+fixedTargetFallbackUSD = input.float(0.01, "Fixed Target When Economic Mode OFF ($)", minval = 0.01, step = 0.01, group = groupExit)
+
+confirmationWindowBars = input.int(1, "Bars Allowed To Confirm", minval = 1, maxval = 3, group = groupExit,
+     tooltip = "UNCHANGED from V1.8. Default 1 = the reaction must begin during the very next 5-minute candle.")
+
+stopBufferATR = input.float(0.025, "Structural Stop Buffer (ATR)", minval = 0.00, step = 0.005, group = groupExit)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. 26-YEAR SURGICAL FILTERS
+// Derived from the complete V1.7 2000-2026 trade export.
+// These do NOT alter the reaction definition, confirmation distance, target,
+// structural stop, or automation message format.
+// ─────────────────────────────────────────────────────────────────────────────
+groupSurgical = "6. 26-Year Surgical Filters"
+
+use26YSurgicalFilters = input.bool(true, "Enable 26-Year Surgical Filters", group = groupSurgical,
+     tooltip = "Blocks only four setup/time intersections that stayed below 90% in both the older and newer halves of the 26-year V1.7 export. Calibrated with a 1-bar confirmation window.")
+filterORHBase12ET = input.bool(true, "Block ORH | BASE — 12 ET Hour", group = groupSurgical)
+filterPMLBase14ET = input.bool(true, "Block PML | BASE — 14 ET Hour", group = groupSurgical)
+filterLearnedStrong13ET = input.bool(true, "Block LEARNED | STRONG — 13 ET Hour", group = groupSurgical)
+filterPDLBase11ET = input.bool(true, "Block PDL | BASE — 11 ET Hour", group = groupSurgical)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. VISUALS / AUTOMATION
+// ─────────────────────────────────────────────────────────────────────────────
+groupVisual = "7. Visuals / Automation"
+
+showNearestLevels = input.bool(true, "Show Nearest Active Support / Resistance", group = groupVisual)
+showSignalLabels = input.bool(true, "Show LONG / SHORT Alert Labels", group = groupVisual)
+showTradeLines = input.bool(true, "Draw Entry / Target / Stop", group = groupVisual)
+showConfidenceData = input.bool(true, "Show Confidence In Data Window", group = groupVisual)
+showDiagnosticsTable = input.bool(true, "Show Win-Rate Diagnostics Table", group = groupVisual)
+showPriceLabels = input.bool(true, "Label ENTRY / TARGET / STOP / EXIT Prices", group = groupVisual)
+dashboardGoalWinRate = input.float(90.0, "Dashboard Goal Win Rate %", minval = 50.0, maxval = 100.0, step = 0.5, group = groupVisual)
+dashboardGoalTradesPerDay = input.float(2.0, "Dashboard Goal Trades / Day", minval = 0.1, step = 0.1, group = groupVisual)
+tintChartForDashboard = input.bool(true, "Tint Chart Background For Dashboard", group = groupVisual)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VALIDATION
+// ─────────────────────────────────────────────────────────────────────────────
+if syminfo.ticker != "QQQ"
+    runtime.error("Asads QQQ Reaction Scalper V1.10A is designed for QQQ only.")
+
+if timeframe.in_seconds() != 300
+    runtime.error("Use Asads QQQ Reaction Scalper V1.10A on the QQQ 5-minute chart.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+f_clamp(float value, float lo, float hi) =>
+    math.max(lo, math.min(hi, value))
+
+f_scale(float value, float lo, float hi, float points) =>
+    hi > lo ? points * f_clamp((value - lo) / (hi - lo), 0.0, 1.0) : 0.0
+
+f_near(float a, float b, float radius) =>
+    not na(a) and not na(b) and math.abs(a - b) <= radius
+
+f_confidenceName(int score) =>
+    string name = "BASE"
+    if score >= aPlusThreshold
+        name := "A+"
+    else if score >= strongThreshold
+        name := "STRONG"
+    name
+
+f_wrText(int wins, int trades) =>
+    trades > 0 ? str.tostring(100.0 * wins / trades, "#.0") + "%" : "n/a"
+
+f_wrValue(int wins, int trades) =>
+    trades > 0 ? 100.0 * wins / trades : na
+
+f_wrColor(int wins, int trades) =>
+    float wr = f_wrValue(wins, trades)
+    color c = color.new(color.gray, 80)
+    if not na(wr)
+        if wr >= 90
+            c := color.new(color.lime, 8)
+        else if wr >= 85
+            c := color.new(color.green, 18)
+        else if wr >= 80
+            c := color.new(color.teal, 28)
+        else if wr >= 75
+            c := color.new(color.orange, 18)
+        else
+            c := color.new(color.red, 12)
+    c
+
+f_goalText(int wins, int trades, float goal) =>
+    trades > 0 and 100.0 * wins / trades >= goal ? "PASS" : "NO"
+
+f_tradesPerDayText(int trades, int daysCount) =>
+    daysCount > 0 ? str.tostring(trades / daysCount, "#.00") : "n/a"
+
+f_yesNoColor(bool ok) =>
+    ok ? color.new(color.lime, 12) : color.new(color.red, 12)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION / CONTEXT
+// ─────────────────────────────────────────────────────────────────────────────
+bool inTradeSession = not na(time(timeframe.period, tradeSession, sessionTZ))
+bool inRTH = not na(time(timeframe.period, "0930-1600", sessionTZ))
+bool inOR = not na(time(timeframe.period, "0930-0945", sessionTZ))
+bool newDay = ta.change(time("D")) != 0
+
+bool dayAllowed = (
+     (dayofweek == dayofweek.monday and tradeMonday) or
+     (dayofweek == dayofweek.tuesday and tradeTuesday) or
+     (dayofweek == dayofweek.wednesday and tradeWednesday) or
+     (dayofweek == dayofweek.thursday and tradeThursday) or
+     (dayofweek == dayofweek.friday and tradeFriday))
+
+float atr = ta.atr(atrLen)
+float atrSafe = math.max(atr, syminfo.mintick)
+float contextATR = math.max(nz(atr[1], atr), syminfo.mintick)
+
+float zoneHalf = zoneHalfATR * contextATR
+float touchAllowance = touchAllowanceATR * contextATR
+float maxPierce = maxPierceATR * contextATR
+float reclaimDistance = reclaimATR * contextATR
+float stopBuffer = math.max(2.0 * syminfo.mintick, stopBufferATR * contextATR)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SAME-TIME-OF-DAY RELATIVE VOLUME
+//
+// Instead of comparing 9:35 AM directly with lunch, keep an EMA for each
+// regular-session 5m time slot. The current bar is divided by PRIOR slot EMA.
+// ─────────────────────────────────────────────────────────────────────────────
+var array<float> slotVolumeEMA = array.new_float(78, na)
+
+int minutesFromOpen = hour(time, sessionTZ) * 60 + minute(time, sessionTZ) - 570
+int slotIndex = int(math.floor(minutesFromOpen / 5.0))
+bool validSlot = inRTH and slotIndex >= 0 and slotIndex < 78
+
+float priorSlotVolume = validSlot ? array.get(slotVolumeEMA, slotIndex) : na
+float slotRVOL = not na(priorSlotVolume) and priorSlotVolume > 0 ? volume / priorSlotVolume : 1.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLASSIC LEVELS — CONFLUENCE ONLY
+// ─────────────────────────────────────────────────────────────────────────────
+// Previous regular-session high/low calculated locally.
+// This avoids all lookahead_on higher-timeframe requests and removes the
+// TradingView "strategy may use look-ahead bias" warning source.
+var float currentRTHHigh = na
+var float currentRTHLow = na
+var float previousRTHHigh = na
+var float previousRTHLow = na
+
+bool firstRTHBar = inRTH and not inRTH[1]
+var int rthDaysSeen = 0
+
+if firstRTHBar
+    rthDaysSeen += 1
+
+if firstRTHBar
+    if not na(currentRTHHigh) and not na(currentRTHLow)
+        previousRTHHigh := currentRTHHigh
+        previousRTHLow := currentRTHLow
+
+    currentRTHHigh := high
+    currentRTHLow := low
+else if inRTH
+    currentRTHHigh := na(currentRTHHigh) ? high : math.max(currentRTHHigh, high)
+    currentRTHLow := na(currentRTHLow) ? low : math.min(currentRTHLow, low)
+
+float pdh = usePD ? previousRTHHigh : na
+float pdl = usePD ? previousRTHLow : na
+
+f_pmLevels() =>
+    var float pmH = na
+    var float pmL = na
+    bool pmNewDay = ta.change(time("D")) != 0
+
+    if pmNewDay
+        pmH := na
+        pmL := na
+
+    if session.ispremarket
+        pmH := na(pmH) ? high : math.max(pmH, high)
+        pmL := na(pmL) ? low : math.min(pmL, low)
+
+    [pmH, pmL]
+
+string extendedTicker = ticker.new(syminfo.prefix, syminfo.ticker, session.extended)
+[pmHighRaw, pmLowRaw] = request.security(
+     extendedTicker,
+     "5",
+     f_pmLevels(),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off)
+
+float pmHigh = usePM ? pmHighRaw : na
+float pmLow = usePM ? pmLowRaw : na
+
+var float orHighState = na
+var float orLowState = na
+
+if newDay
+    orHighState := na
+    orLowState := na
+
+if inOR
+    orHighState := na(orHighState) ? high : math.max(orHighState, high)
+    orLowState := na(orLowState) ? low : math.min(orLowState, low)
+
+bool orReady = inRTH and not inOR and not na(orHighState) and not na(orLowState)
+float orHigh = useOR and orReady ? orHighState : na
+float orLow = useOR and orReady ? orLowState : na
+
+float rthVWAP = ta.vwap(hlc3, session.isfirstbar_regular)
+float currentVWAP = useVWAP and inRTH ? rthVWAP : na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERSISTENT LEVEL MEMORY
+//
+// role: +1 support, -1 resistance
+// active: false after decisive confirmed break
+// touches: independent historical rejection events
+// quality: average formation departure measured in ATR
+// ─────────────────────────────────────────────────────────────────────────────
+var array<float> levelPrice = array.new_float()
+var array<int> levelRole = array.new_int()
+var array<int> levelTouches = array.new_int()
+var array<int> levelLastTouchBar = array.new_int()
+var array<int> levelCreatedBar = array.new_int()
+var array<float> levelQuality = array.new_float()
+var array<bool> levelActive = array.new_bool()
+
+float pivotH = ta.pivothigh(high, pivotLeft, pivotRight)
+float pivotL = ta.pivotlow(low, pivotLeft, pivotRight)
+
+// Confirmed historical resistance rejection.
+if not na(pivotH)
+    int pivotBarH = bar_index - pivotRight
+    float pivotAtrH = math.max(nz(atr[pivotRight], atr), syminfo.mintick)
+    float postPivotLow = ta.lowest(low, pivotRight + 1)
+    float departureH = (pivotH - postPivotLow) / pivotAtrH
+
+    if departureH >= formationDepartureATR
+        float mergeRadiusH = mergeRadiusATR * pivotAtrH
+        int bestIndexH = -1
+        float bestDistanceH = 1e10
+
+        int countH = array.size(levelPrice)
+        if countH > 0
+            for i = 0 to countH - 1
+                if array.get(levelActive, i) and array.get(levelRole, i) == -1
+                    float rememberedH = array.get(levelPrice, i)
+                    int lastTouchH = array.get(levelLastTouchBar, i)
+                    float distanceH = math.abs(pivotH - rememberedH)
+
+                    if distanceH <= mergeRadiusH and pivotBarH - lastTouchH >= minTouchSeparation
+                        if distanceH < bestDistanceH
+                            bestDistanceH := distanceH
+                            bestIndexH := i
+
+        if bestIndexH >= 0
+            int oldTouchesH = array.get(levelTouches, bestIndexH)
+            float oldPriceH = array.get(levelPrice, bestIndexH)
+            float oldQualityH = array.get(levelQuality, bestIndexH)
+            int newTouchesH = oldTouchesH + 1
+
+            array.set(levelPrice, bestIndexH, (oldPriceH * oldTouchesH + pivotH) / newTouchesH)
+            array.set(levelTouches, bestIndexH, newTouchesH)
+            array.set(levelLastTouchBar, bestIndexH, pivotBarH)
+            array.set(levelQuality, bestIndexH, (oldQualityH * oldTouchesH + departureH) / newTouchesH)
+        else
+            array.push(levelPrice, pivotH)
+            array.push(levelRole, -1)
+            array.push(levelTouches, 1)
+            array.push(levelLastTouchBar, pivotBarH)
+            array.push(levelCreatedBar, pivotBarH)
+            array.push(levelQuality, departureH)
+            array.push(levelActive, true)
+
+// Confirmed historical support rejection.
+if not na(pivotL)
+    int pivotBarL = bar_index - pivotRight
+    float pivotAtrL = math.max(nz(atr[pivotRight], atr), syminfo.mintick)
+    float postPivotHigh = ta.highest(high, pivotRight + 1)
+    float departureL = (postPivotHigh - pivotL) / pivotAtrL
+
+    if departureL >= formationDepartureATR
+        float mergeRadiusL = mergeRadiusATR * pivotAtrL
+        int bestIndexL = -1
+        float bestDistanceL = 1e10
+
+        int countL = array.size(levelPrice)
+        if countL > 0
+            for i = 0 to countL - 1
+                if array.get(levelActive, i) and array.get(levelRole, i) == 1
+                    float rememberedL = array.get(levelPrice, i)
+                    int lastTouchL = array.get(levelLastTouchBar, i)
+                    float distanceL = math.abs(pivotL - rememberedL)
+
+                    if distanceL <= mergeRadiusL and pivotBarL - lastTouchL >= minTouchSeparation
+                        if distanceL < bestDistanceL
+                            bestDistanceL := distanceL
+                            bestIndexL := i
+
+        if bestIndexL >= 0
+            int oldTouchesL = array.get(levelTouches, bestIndexL)
+            float oldPriceL = array.get(levelPrice, bestIndexL)
+            float oldQualityL = array.get(levelQuality, bestIndexL)
+            int newTouchesL = oldTouchesL + 1
+
+            array.set(levelPrice, bestIndexL, (oldPriceL * oldTouchesL + pivotL) / newTouchesL)
+            array.set(levelTouches, bestIndexL, newTouchesL)
+            array.set(levelLastTouchBar, bestIndexL, pivotBarL)
+            array.set(levelQuality, bestIndexL, (oldQualityL * oldTouchesL + departureL) / newTouchesL)
+        else
+            array.push(levelPrice, pivotL)
+            array.push(levelRole, 1)
+            array.push(levelTouches, 1)
+            array.push(levelLastTouchBar, pivotBarL)
+            array.push(levelCreatedBar, pivotBarL)
+            array.push(levelQuality, departureL)
+            array.push(levelActive, true)
+
+// Cap memory size.
+while array.size(levelPrice) > maxStoredLevels
+    array.shift(levelPrice)
+    array.shift(levelRole)
+    array.shift(levelTouches)
+    array.shift(levelLastTouchBar)
+    array.shift(levelCreatedBar)
+    array.shift(levelQuality)
+    array.shift(levelActive)
+
+// Confirmed decisive break permanently invalidates old level.
+// No flip/reversal logic in V1.0.
+if barstate.isconfirmed and array.size(levelPrice) > 0
+    for i = 0 to array.size(levelPrice) - 1
+        if array.get(levelActive, i)
+            float remembered = array.get(levelPrice, i)
+            int rememberedRole = array.get(levelRole, i)
+            float breakDistance = breakDistanceATR * atrSafe
+
+            if rememberedRole == -1 and close > remembered + breakDistance
+                array.set(levelActive, i, false)
+            else if rememberedRole == 1 and close < remembered - breakDistance
+                array.set(levelActive, i, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIND NEAREST VALID SUPPORT / RESISTANCE
+// ─────────────────────────────────────────────────────────────────────────────
+float activeSupport = na
+float activeResistance = na
+int supportIndex = -1
+int resistanceIndex = -1
+float supportDistance = 1e10
+float resistanceDistance = 1e10
+
+if array.size(levelPrice) > 0
+    for i = 0 to array.size(levelPrice) - 1
+        bool isActive = array.get(levelActive, i)
+        int touches = array.get(levelTouches, i)
+        int role = array.get(levelRole, i)
+        int lastTouchBar = array.get(levelLastTouchBar, i)
+        int ageBars = bar_index - lastTouchBar
+
+        bool eligible = isActive and touches >= minTouches and ageBars <= maxLevelAgeBars
+
+        if eligible and role == 1
+            float distance = math.abs(low - array.get(levelPrice, i))
+            if distance < supportDistance
+                supportDistance := distance
+                activeSupport := array.get(levelPrice, i)
+                supportIndex := i
+
+        if eligible and role == -1
+            float distance = math.abs(high - array.get(levelPrice, i))
+            if distance < resistanceDistance
+                resistanceDistance := distance
+                activeResistance := array.get(levelPrice, i)
+                resistanceIndex := i
+
+// Classic reaction candidates. VWAP is intentionally NOT a primary trade level.
+float classicSupport = na
+string classicSupportName = ""
+float classicSupportDistance = 1e10
+
+if tradeClassicLevels
+    if not na(pdl)
+        float d = math.abs(low - pdl)
+        if d < classicSupportDistance
+            classicSupport := pdl
+            classicSupportName := "PDL"
+            classicSupportDistance := d
+
+    if not na(pmLow)
+        float d = math.abs(low - pmLow)
+        if d < classicSupportDistance
+            classicSupport := pmLow
+            classicSupportName := "PML"
+            classicSupportDistance := d
+
+    if not na(orLow)
+        float d = math.abs(low - orLow)
+        if d < classicSupportDistance
+            classicSupport := orLow
+            classicSupportName := "ORL"
+            classicSupportDistance := d
+
+float classicResistance = na
+string classicResistanceName = ""
+float classicResistanceDistance = 1e10
+
+if tradeClassicLevels
+    if not na(pdh)
+        float d = math.abs(high - pdh)
+        if d < classicResistanceDistance
+            classicResistance := pdh
+            classicResistanceName := "PDH"
+            classicResistanceDistance := d
+
+    if not na(pmHigh)
+        float d = math.abs(high - pmHigh)
+        if d < classicResistanceDistance
+            classicResistance := pmHigh
+            classicResistanceName := "PMH"
+            classicResistanceDistance := d
+
+    if not na(orHigh)
+        float d = math.abs(high - orHigh)
+        if d < classicResistanceDistance
+            classicResistance := orHigh
+            classicResistanceName := "ORH"
+            classicResistanceDistance := d
+
+float learnedSupportDistance = not na(activeSupport) ? math.abs(low - activeSupport) : 1e10
+float learnedResistanceDistance = not na(activeResistance) ? math.abs(high - activeResistance) : 1e10
+
+bool usingClassicSupport = not na(classicSupport) and classicSupportDistance < learnedSupportDistance
+bool usingClassicResistance = not na(classicResistance) and classicResistanceDistance < learnedResistanceDistance
+
+float selectedSupport = usingClassicSupport ? classicSupport : activeSupport
+float selectedResistance = usingClassicResistance ? classicResistance : activeResistance
+
+string selectedSupportName = usingClassicSupport ? classicSupportName : "LEARNED"
+string selectedResistanceName = usingClassicResistance ? classicResistanceName : "LEARNED"
+
+float selectedSupportZoneHalf = usingClassicSupport ? classicZoneHalfATR * contextATR : zoneHalf
+float selectedResistanceZoneHalf = usingClassicResistance ? classicZoneHalfATR * contextATR : zoneHalf
+
+float supportUpper = not na(selectedSupport) ? selectedSupport + selectedSupportZoneHalf : na
+float supportLower = not na(selectedSupport) ? selectedSupport - selectedSupportZoneHalf : na
+float resistanceUpper = not na(selectedResistance) ? selectedResistance + selectedResistanceZoneHalf : na
+float resistanceLower = not na(selectedResistance) ? selectedResistance - selectedResistanceZoneHalf : na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CURRENT CONFIRMED REACTION — HARD GATES
+// ─────────────────────────────────────────────────────────────────────────────
+float longRejectATR = (close - low) / atrSafe
+float shortRejectATR = (high - close) / atrSafe
+
+bool longApproachCorrect = not na(selectedSupport) and close[1] >= selectedSupport - selectedSupportZoneHalf
+bool shortApproachCorrect = not na(selectedResistance) and close[1] <= selectedResistance + selectedResistanceZoneHalf
+
+bool supportTouched = not na(supportUpper) and low <= supportUpper + touchAllowance
+bool resistanceTouched = not na(resistanceLower) and high >= resistanceLower - touchAllowance
+
+bool supportNotDestroyed = not na(supportLower) and low >= supportLower - maxPierce
+bool resistanceNotDestroyed = not na(resistanceUpper) and high <= resistanceUpper + maxPierce
+
+bool supportReclaimed = not na(selectedSupport) and close >= selectedSupport + reclaimDistance
+bool resistanceReclaimed = not na(selectedResistance) and close <= selectedResistance - reclaimDistance
+
+bool longBodyOK = not requireDirectionalBody or close > open
+bool shortBodyOK = not requireDirectionalBody or close < open
+
+bool basicLongReaction = (
+     longApproachCorrect and
+     supportTouched and
+     supportNotDestroyed and
+     supportReclaimed and
+     longRejectATR >= minRejectionDisplacementATR and
+     longBodyOK)
+
+bool basicShortReaction = (
+     shortApproachCorrect and
+     resistanceTouched and
+     resistanceNotDestroyed and
+     resistanceReclaimed and
+     shortRejectATR >= minRejectionDisplacementATR and
+     shortBodyOK)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIDENCE FEATURES — SOFT, NOT ENTRY VETOES
+// ─────────────────────────────────────────────────────────────────────────────
+int supportTouches = usingClassicSupport ? 2 : supportIndex >= 0 ? array.get(levelTouches, supportIndex) : 0
+int resistanceTouches = usingClassicResistance ? 2 : resistanceIndex >= 0 ? array.get(levelTouches, resistanceIndex) : 0
+
+float supportQuality = usingClassicSupport ? 0.45 : supportIndex >= 0 ? array.get(levelQuality, supportIndex) : 0.0
+float resistanceQuality = usingClassicResistance ? 0.45 : resistanceIndex >= 0 ? array.get(levelQuality, resistanceIndex) : 0.0
+
+int supportAge = usingClassicSupport ? 0 : supportIndex >= 0 ? bar_index - array.get(levelLastTouchBar, supportIndex) : 1000000
+int resistanceAge = usingClassicResistance ? 0 : resistanceIndex >= 0 ? bar_index - array.get(levelLastTouchBar, resistanceIndex) : 1000000
+
+int supportConfluence = 0
+int resistanceConfluence = 0
+float classicRadius = confluenceATR * contextATR
+
+if not na(selectedSupport)
+    supportConfluence += f_near(selectedSupport, pdl, classicRadius) ? 1 : 0
+    supportConfluence += f_near(selectedSupport, pmLow, classicRadius) ? 1 : 0
+    supportConfluence += f_near(selectedSupport, orLow, classicRadius) ? 1 : 0
+    supportConfluence += f_near(selectedSupport, currentVWAP, classicRadius) ? 1 : 0
+
+if not na(selectedResistance)
+    resistanceConfluence += f_near(selectedResistance, pdh, classicRadius) ? 1 : 0
+    resistanceConfluence += f_near(selectedResistance, pmHigh, classicRadius) ? 1 : 0
+    resistanceConfluence += f_near(selectedResistance, orHigh, classicRadius) ? 1 : 0
+    resistanceConfluence += f_near(selectedResistance, currentVWAP, classicRadius) ? 1 : 0
+
+float approachMoveATR = (close[1] - close[1 + approachBars]) / contextATR
+
+float barSpan = math.max(high - low, syminfo.mintick)
+float lowerWickFraction = (math.min(open, close) - low) / barSpan
+float upperWickFraction = (high - math.max(open, close)) / barSpan
+float longCloseLocation = (close - low) / barSpan
+float shortCloseLocation = (high - close) / barSpan
+
+float longScoreRaw = 40.0
+longScoreRaw += supportTouches >= 3 ? 6.0 : 0.0
+longScoreRaw += supportTouches >= 4 ? 4.0 : 0.0
+longScoreRaw += supportAge <= freshBars1 ? 10.0 : supportAge <= freshBars2 ? 6.0 : 2.0
+longScoreRaw += f_scale(supportQuality, formationDepartureATR, 0.90, 10.0)
+longScoreRaw += math.min(10.0, supportConfluence * 3.0)
+longScoreRaw += f_scale(longRejectATR, minRejectionDisplacementATR, 0.45, 10.0)
+longScoreRaw += f_scale(longCloseLocation, 0.50, 0.90, 5.0)
+longScoreRaw += f_scale(lowerWickFraction, 0.10, 0.55, 4.0)
+longScoreRaw += slotRVOL >= 1.50 ? 7.0 : slotRVOL >= 1.15 ? 4.0 : 0.0
+longScoreRaw -= approachMoveATR < -0.90 ? 12.0 : approachMoveATR < -0.60 ? 6.0 : 0.0
+
+float shortScoreRaw = 40.0
+shortScoreRaw += resistanceTouches >= 3 ? 6.0 : 0.0
+shortScoreRaw += resistanceTouches >= 4 ? 4.0 : 0.0
+shortScoreRaw += resistanceAge <= freshBars1 ? 10.0 : resistanceAge <= freshBars2 ? 6.0 : 2.0
+shortScoreRaw += f_scale(resistanceQuality, formationDepartureATR, 0.90, 10.0)
+shortScoreRaw += math.min(10.0, resistanceConfluence * 3.0)
+shortScoreRaw += f_scale(shortRejectATR, minRejectionDisplacementATR, 0.45, 10.0)
+shortScoreRaw += f_scale(shortCloseLocation, 0.50, 0.90, 5.0)
+shortScoreRaw += f_scale(upperWickFraction, 0.10, 0.55, 4.0)
+shortScoreRaw += slotRVOL >= 1.50 ? 7.0 : slotRVOL >= 1.15 ? 4.0 : 0.0
+shortScoreRaw -= approachMoveATR > 0.90 ? 12.0 : approachMoveATR > 0.60 ? 6.0 : 0.0
+
+int longConfidence = int(math.round(f_clamp(longScoreRaw, 0.0, 100.0)))
+int shortConfidence = int(math.round(f_clamp(shortScoreRaw, 0.0, 100.0)))
+
+string longConfidenceName = f_confidenceName(longConfidence)
+string shortConfidenceName = f_confidenceName(shortConfidence)
+
+float confirmationMove = math.max(syminfo.mintick, confirmationUSD)
+
+f_roundTick(float value) =>
+    math.round(value / syminfo.mintick) * syminfo.mintick
+
+f_targetDistanceFromRisk(float structuralRiskUSD) =>
+    float fixedFallback = math.max(syminfo.mintick, fixedTargetFallbackUSD)
+    float rawEconomic = structuralRiskUSD * economicTargetR
+    float boundedEconomic = math.max(economicTargetMinUSD, math.min(economicTargetMaxUSD, rawEconomic))
+    float selected = useEconomicTarget ? boundedEconomic : fixedFallback
+    math.max(syminfo.mintick, f_roundTick(selected))
+
+float longStopPlan = not na(supportLower) ? math.min(low, supportLower) - stopBuffer : na
+float shortStopPlan = not na(resistanceUpper) ? math.max(high, resistanceUpper) + stopBuffer : na
+
+float longConfirmPlan = f_roundTick(close + confirmationMove)
+float shortConfirmPlan = f_roundTick(close - confirmationMove)
+
+float longStructureRiskUSD = not na(longStopPlan) ? longConfirmPlan - longStopPlan : na
+float shortStructureRiskUSD = not na(shortStopPlan) ? shortStopPlan - shortConfirmPlan : na
+
+float failureDistance = math.max(syminfo.mintick, reactionFailureUSD)
+float longFailureStopPlan = f_roundTick(longConfirmPlan - failureDistance)
+float shortFailureStopPlan = f_roundTick(shortConfirmPlan + failureDistance)
+
+// Keep the original structural level as backup context. The executable stop is
+// the closer price because this strategy is monetizing an IMMEDIATE reaction.
+float longEffectiveStopPlan = useReactionFailureStop ? math.max(longStopPlan, longFailureStopPlan) : longStopPlan
+float shortEffectiveStopPlan = useReactionFailureStop ? math.min(shortStopPlan, shortFailureStopPlan) : shortStopPlan
+
+float longTargetDistancePlan = not na(longStructureRiskUSD) ? f_targetDistanceFromRisk(longStructureRiskUSD) : economicTargetMinUSD
+float shortTargetDistancePlan = not na(shortStructureRiskUSD) ? f_targetDistanceFromRisk(shortStructureRiskUSD) : economicTargetMinUSD
+
+int longTargetTicksPlan = math.max(1, int(math.round(longTargetDistancePlan / syminfo.mintick)))
+int shortTargetTicksPlan = math.max(1, int(math.round(shortTargetDistancePlan / syminfo.mintick)))
+
+float longStructureRiskATR = not na(longStopPlan) ? (close - longStopPlan) / atrSafe : 999.0
+float shortStructureRiskATR = not na(shortStopPlan) ? (shortStopPlan - close) / atrSafe : 999.0
+
+bool longRiskOK = longStructureRiskATR > 0 and longStructureRiskATR <= maxStructureRiskATR
+bool shortRiskOK = shortStructureRiskATR > 0 and shortStructureRiskATR <= maxStructureRiskATR
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL / ORDER STATE — V1.7
+//
+// CONFIRMED 5m rejection close -> ARM.
+// Actual entry = stop order confirmationUSD in favorable direction.
+// No alert() entry is sent at ARM time.
+// The strategy ENTRY order itself carries the LONG/SHORT automation alert.
+// ─────────────────────────────────────────────────────────────────────────────
+varip int activeDir = 0                 // 0 flat, +1 armed/live long, -1 armed/live short
+varip bool activeFilled = false
+varip float activeSignalClose = na
+varip float activeConfirmPrice = na
+varip float activeEntry = na
+varip float activeStop = na
+varip float activeStructuralStop = na
+varip float activeFailureStop = na
+varip float activeTarget = na
+varip float activeTargetDistance = na
+varip int activeTargetTicks = 1
+varip float activePlannedRiskUSD = na
+varip float activeLevel = na
+varip float activeATR = na
+varip int activeConfidence = 0
+varip string activeConfidenceName = ""
+varip string activeLevelName = ""
+varip int activeSignalBar = na
+varip int activeEntryBar = na
+varip float activeMFE = 0.0
+varip string forcedExitReason = ""
+varip int lastClosedTradeCount = 0
+var int lastSignalBar = na
+
+var line armedConfirmLine = na
+var line tradeEntryLine = na
+var line tradeTargetLine = na
+var line tradeStopLine = na
+var line tradeStructuralStopLine = na
+
+// Persistent closed-trade diagnostics.
+var int diagArmedAll = 0
+var int diagExpiredAll = 0
+
+var int diagFilteredAll = 0
+var int diagTarget1Cent = 0
+var int diagTarget2Cent = 0
+var float diagTargetCentsSum = 0.0
+
+var int diagExitTarget = 0
+var int diagExitFailure = 0
+var int diagExitStructural = 0
+var int diagExitOther = 0
+var float diagPnlTarget = 0.0
+var float diagPnlFailure = 0.0
+var float diagPnlStructural = 0.0
+var float diagPnlOther = 0.0
+
+var int diagFilterORHBase12 = 0
+var int diagFilterPMLBase14 = 0
+var int diagFilterLearnedStrong13 = 0
+var int diagFilterPDLBase11 = 0
+
+var int diagTradesAll = 0
+var int diagWinsAll = 0
+var int diagTradesLong = 0
+var int diagWinsLong = 0
+var int diagTradesShort = 0
+var int diagWinsShort = 0
+
+var int diagTradesLearned = 0
+var int diagWinsLearned = 0
+var int diagTradesPDH = 0
+var int diagWinsPDH = 0
+var int diagTradesPDL = 0
+var int diagWinsPDL = 0
+var int diagTradesPMH = 0
+var int diagWinsPMH = 0
+var int diagTradesPML = 0
+var int diagWinsPML = 0
+var int diagTradesORH = 0
+var int diagWinsORH = 0
+var int diagTradesORL = 0
+var int diagWinsORL = 0
+
+var int diagTradesBase = 0
+var int diagWinsBase = 0
+var int diagTradesStrong = 0
+var int diagWinsStrong = 0
+var int diagTradesAPlus = 0
+var int diagWinsAPlus = 0
+
+bool longEntryEvent = false
+bool shortEntryEvent = false
+bool sellExitEvent = false
+bool expiredSetupEvent = false
+
+bool flatAndReady = strategy.position_size == 0 and activeDir == 0
+bool cooldownOK = na(lastSignalBar) or bar_index - lastSignalBar > entryCooldownBars
+
+bool rawConfirmedLongSignal = (
+     barstate.isconfirmed and
+     inTradeSession and
+     dayAllowed and
+     flatAndReady and
+     cooldownOK and
+     basicLongReaction and
+     longRiskOK)
+
+bool rawConfirmedShortSignal = (
+     barstate.isconfirmed and
+     inTradeSession and
+     dayAllowed and
+     flatAndReady and
+     cooldownOK and
+     basicShortReaction and
+     shortRiskOK)
+
+// V1.8 surgical filters.
+// With the default 1-bar confirmation window, time_close on the ARM candle is
+// the timestamp of the confirmation/fill bar used in the exported trade CSV.
+int prospectiveConfirmHourET = hour(time_close, sessionTZ)
+
+bool blockPMLBase14Long = (
+     use26YSurgicalFilters and
+     filterPMLBase14ET and
+     selectedSupportName == "PML" and
+     longConfidenceName == "BASE" and
+     prospectiveConfirmHourET == 14)
+
+bool blockPDLBase11Long = (
+     use26YSurgicalFilters and
+     filterPDLBase11ET and
+     selectedSupportName == "PDL" and
+     longConfidenceName == "BASE" and
+     prospectiveConfirmHourET == 11)
+
+bool blockLearnedStrong13Long = (
+     use26YSurgicalFilters and
+     filterLearnedStrong13ET and
+     selectedSupportName == "LEARNED" and
+     longConfidenceName == "STRONG" and
+     prospectiveConfirmHourET == 13)
+
+bool blockORHBase12Short = (
+     use26YSurgicalFilters and
+     filterORHBase12ET and
+     selectedResistanceName == "ORH" and
+     shortConfidenceName == "BASE" and
+     prospectiveConfirmHourET == 12)
+
+bool blockLearnedStrong13Short = (
+     use26YSurgicalFilters and
+     filterLearnedStrong13ET and
+     selectedResistanceName == "LEARNED" and
+     shortConfidenceName == "STRONG" and
+     prospectiveConfirmHourET == 13)
+
+bool surgicalBlockLong = blockPMLBase14Long or blockPDLBase11Long or blockLearnedStrong13Long
+bool surgicalBlockShort = blockORHBase12Short or blockLearnedStrong13Short
+
+// Count raw setups removed by V1.8. Counters are diagnostic only.
+if rawConfirmedLongSignal and surgicalBlockLong
+    diagFilteredAll += 1
+    if blockPMLBase14Long
+        diagFilterPMLBase14 += 1
+    if blockPDLBase11Long
+        diagFilterPDLBase11 += 1
+    if blockLearnedStrong13Long
+        diagFilterLearnedStrong13 += 1
+
+if rawConfirmedShortSignal and surgicalBlockShort
+    diagFilteredAll += 1
+    if blockORHBase12Short
+        diagFilterORHBase12 += 1
+    if blockLearnedStrong13Short
+        diagFilterLearnedStrong13 += 1
+
+bool confirmedLongSignal = rawConfirmedLongSignal and not surgicalBlockLong
+bool confirmedShortSignal = rawConfirmedShortSignal and not surgicalBlockShort
+
+// If both somehow qualify, arm the clearer rejection.
+bool takeLongSignal = confirmedLongSignal and (not confirmedShortSignal or longConfidence > shortConfidence)
+bool takeShortSignal = confirmedShortSignal and (not confirmedLongSignal or shortConfidence > longConfidence)
+
+if takeLongSignal
+    activeDir := 1
+    activeFilled := false
+    activeSignalClose := close
+    activeConfirmPrice := longConfirmPlan
+    activeEntry := activeConfirmPrice
+    activeStructuralStop := longStopPlan
+    activeFailureStop := longFailureStopPlan
+    activeStop := longEffectiveStopPlan
+    activePlannedRiskUSD := longStructureRiskUSD
+    activeTargetDistance := longTargetDistancePlan
+    activeTargetTicks := longTargetTicksPlan
+    activeTarget := f_roundTick(activeConfirmPrice + activeTargetDistance)
+    activeLevel := selectedSupport
+    activeATR := contextATR
+    activeConfidence := longConfidence
+    activeConfidenceName := longConfidenceName
+    activeLevelName := selectedSupportName
+    activeSignalBar := bar_index
+    activeEntryBar := na
+    activeMFE := 0.0
+    forcedExitReason := ""
+    lastSignalBar := bar_index
+    diagArmedAll += 1
+    diagTargetCentsSum += activeTargetDistance / syminfo.mintick
+    if activeTargetTicks <= 1
+        diagTarget1Cent += 1
+    else
+        diagTarget2Cent += 1
+
+    string longFillAlert = (
+         "LONG QQQ | REACTION CONFIRMED" +
+         " | TRIGGER " + str.tostring(activeConfirmPrice, format.mintick) +
+         " | TARGET +" + str.tostring(activeTargetDistance, format.mintick) +
+         " | FAILURE_SL " + str.tostring(activeFailureStop, format.mintick) +
+         " | STRUCT_SL " + str.tostring(activeStructuralStop, format.mintick) +
+         " | LEVEL " + str.tostring(activeLevel, format.mintick) +
+         " | LEVEL_TYPE " + activeLevelName +
+         " | CONF " + activeConfidenceName +
+         " | SCORE " + str.tostring(activeConfidence))
+
+    string longExitFillAlert = (
+         "EXIT QQQ | REACTION BRACKET" +
+         " | LEVEL_TYPE " + activeLevelName +
+         " | CONF " + activeConfidenceName)
+
+    strategy.entry(
+         "CALL CONFIRM",
+         strategy.long,
+         stop = activeConfirmPrice,
+         comment = activeLevelName + "|" + activeConfidenceName,
+         alert_message = longFillAlert)
+
+    strategy.exit(
+         "CALL BRACKET",
+         from_entry = "CALL CONFIRM",
+         profit = activeTargetTicks,
+         stop = activeStop,
+         alert_message = longExitFillAlert)
+
+    if showTradeLines
+        armedConfirmLine := line.new(
+             bar_index,
+             activeConfirmPrice,
+             bar_index + confirmationWindowBars + 1,
+             activeConfirmPrice,
+             color = color.orange,
+             width = 2,
+             style = line.style_dotted)
+
+    if showSignalLabels
+        label.new(
+             bar_index,
+             low,
+             "ARM LONG QQQ\n" +
+             "NO ENTRY YET\n" +
+             "TRIGGER " + str.tostring(activeConfirmPrice, format.mintick) +
+             "\nTHEN TARGET +" + str.tostring(activeTargetDistance, format.mintick) +
+             "\nFAIL SL " + str.tostring(activeFailureStop, format.mintick) +
+             "\nSTRUCT " + str.tostring(activeStructuralStop, format.mintick) +
+             "\nTYPE " + activeLevelName +
+             "\n" + activeConfidenceName + " " + str.tostring(activeConfidence),
+             style = label.style_label_up,
+             color = color.orange,
+             textcolor = color.black,
+             size = size.small)
+
+else if takeShortSignal
+    activeDir := -1
+    activeFilled := false
+    activeSignalClose := close
+    activeConfirmPrice := shortConfirmPlan
+    activeEntry := activeConfirmPrice
+    activeStructuralStop := shortStopPlan
+    activeFailureStop := shortFailureStopPlan
+    activeStop := shortEffectiveStopPlan
+    activePlannedRiskUSD := shortStructureRiskUSD
+    activeTargetDistance := shortTargetDistancePlan
+    activeTargetTicks := shortTargetTicksPlan
+    activeTarget := f_roundTick(activeConfirmPrice - activeTargetDistance)
+    activeLevel := selectedResistance
+    activeATR := contextATR
+    activeConfidence := shortConfidence
+    activeConfidenceName := shortConfidenceName
+    activeLevelName := selectedResistanceName
+    activeSignalBar := bar_index
+    activeEntryBar := na
+    activeMFE := 0.0
+    forcedExitReason := ""
+    lastSignalBar := bar_index
+    diagArmedAll += 1
+    diagTargetCentsSum += activeTargetDistance / syminfo.mintick
+    if activeTargetTicks <= 1
+        diagTarget1Cent += 1
+    else
+        diagTarget2Cent += 1
+
+    string shortFillAlert = (
+         "SHORT QQQ | REACTION CONFIRMED" +
+         " | TRIGGER " + str.tostring(activeConfirmPrice, format.mintick) +
+         " | TARGET -" + str.tostring(activeTargetDistance, format.mintick) +
+         " | FAILURE_SL " + str.tostring(activeFailureStop, format.mintick) +
+         " | STRUCT_SL " + str.tostring(activeStructuralStop, format.mintick) +
+         " | LEVEL " + str.tostring(activeLevel, format.mintick) +
+         " | LEVEL_TYPE " + activeLevelName +
+         " | CONF " + activeConfidenceName +
+         " | SCORE " + str.tostring(activeConfidence))
+
+    string shortExitFillAlert = (
+         "EXIT QQQ | REACTION BRACKET" +
+         " | LEVEL_TYPE " + activeLevelName +
+         " | CONF " + activeConfidenceName)
+
+    strategy.entry(
+         "PUT CONFIRM",
+         strategy.short,
+         stop = activeConfirmPrice,
+         comment = activeLevelName + "|" + activeConfidenceName,
+         alert_message = shortFillAlert)
+
+    strategy.exit(
+         "PUT BRACKET",
+         from_entry = "PUT CONFIRM",
+         profit = activeTargetTicks,
+         stop = activeStop,
+         alert_message = shortExitFillAlert)
+
+    if showTradeLines
+        armedConfirmLine := line.new(
+             bar_index,
+             activeConfirmPrice,
+             bar_index + confirmationWindowBars + 1,
+             activeConfirmPrice,
+             color = color.orange,
+             width = 2,
+             style = line.style_dotted)
+
+    if showSignalLabels
+        label.new(
+             bar_index,
+             high,
+             "ARM SHORT QQQ\n" +
+             "NO ENTRY YET\n" +
+             "TRIGGER " + str.tostring(activeConfirmPrice, format.mintick) +
+             "\nTHEN TARGET -" + str.tostring(activeTargetDistance, format.mintick) +
+             "\nFAIL SL " + str.tostring(activeFailureStop, format.mintick) +
+             "\nSTRUCT " + str.tostring(activeStructuralStop, format.mintick) +
+             "\nTYPE " + activeLevelName +
+             "\n" + activeConfidenceName + " " + str.tostring(activeConfidence),
+             style = label.style_label_down,
+             color = color.orange,
+             textcolor = color.black,
+             size = size.small)
+
+// Detect an entry that is still open at this calculation.
+// Same-bar entry+exit trades are handled from strategy.closedtrades below.
+if strategy.position_size > 0 and activeDir == 1 and not activeFilled
+    activeFilled := true
+    activeEntry := strategy.position_avg_price
+    activeTarget := f_roundTick(activeEntry + activeTargetDistance)
+    activeEntryBar := bar_index
+    longEntryEvent := true
+
+    if not na(armedConfirmLine)
+        line.set_color(armedConfirmLine, color.new(color.orange, 70))
+
+    if showTradeLines
+        tradeEntryLine := line.new(bar_index, activeEntry, bar_index + 1, activeEntry, color = color.white, width = 2)
+        tradeTargetLine := line.new(bar_index, activeTarget, bar_index + 1, activeTarget, color = color.lime, width = 2, style = line.style_dashed)
+        tradeStopLine := line.new(bar_index, activeStop, bar_index + 1, activeStop, color = color.red, width = 2, style = line.style_dashed)
+        tradeStructuralStopLine := line.new(bar_index, activeStructuralStop, bar_index + 1, activeStructuralStop, color = color.new(color.red, 72), width = 1, style = line.style_dotted)
+
+        if showPriceLabels
+            label.new(bar_index, activeEntry, "LONG ENTRY " + str.tostring(activeEntry, format.mintick), style = label.style_label_left, color = color.lime, textcolor = color.black, size = size.tiny)
+            label.new(bar_index, activeTarget, "TARGET " + str.tostring(activeTarget, format.mintick), style = label.style_label_left, color = color.lime, textcolor = color.black, size = size.tiny)
+            label.new(bar_index, activeStop, "FAIL STOP " + str.tostring(activeStop, format.mintick), style = label.style_label_left, color = color.red, textcolor = color.white, size = size.tiny)
+            label.new(bar_index, activeStructuralStop, "STRUCT BACKUP " + str.tostring(activeStructuralStop, format.mintick), style = label.style_label_left, color = color.new(color.red, 72), textcolor = color.white, size = size.tiny)
+
+if strategy.position_size < 0 and activeDir == -1 and not activeFilled
+    activeFilled := true
+    activeEntry := strategy.position_avg_price
+    activeTarget := f_roundTick(activeEntry - activeTargetDistance)
+    activeEntryBar := bar_index
+    shortEntryEvent := true
+
+    if not na(armedConfirmLine)
+        line.set_color(armedConfirmLine, color.new(color.orange, 70))
+
+    if showTradeLines
+        tradeEntryLine := line.new(bar_index, activeEntry, bar_index + 1, activeEntry, color = color.white, width = 2)
+        tradeTargetLine := line.new(bar_index, activeTarget, bar_index + 1, activeTarget, color = color.lime, width = 2, style = line.style_dashed)
+        tradeStopLine := line.new(bar_index, activeStop, bar_index + 1, activeStop, color = color.red, width = 2, style = line.style_dashed)
+        tradeStructuralStopLine := line.new(bar_index, activeStructuralStop, bar_index + 1, activeStructuralStop, color = color.new(color.red, 72), width = 1, style = line.style_dotted)
+
+        if showPriceLabels
+            label.new(bar_index, activeEntry, "SHORT ENTRY " + str.tostring(activeEntry, format.mintick), style = label.style_label_left, color = color.red, textcolor = color.white, size = size.tiny)
+            label.new(bar_index, activeTarget, "TARGET " + str.tostring(activeTarget, format.mintick), style = label.style_label_left, color = color.lime, textcolor = color.black, size = size.tiny)
+            label.new(bar_index, activeStop, "FAIL STOP " + str.tostring(activeStop, format.mintick), style = label.style_label_left, color = color.red, textcolor = color.white, size = size.tiny)
+            label.new(bar_index, activeStructuralStop, "STRUCT BACKUP " + str.tostring(activeStructuralStop, format.mintick), style = label.style_label_left, color = color.new(color.red, 72), textcolor = color.white, size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BRACKET + ONE-BAR REACTION WINDOW
+// ─────────────────────────────────────────────────────────────────────────────
+if strategy.position_size > 0 and activeDir == 1
+    strategy.exit(
+         "CALL BRACKET",
+         from_entry = "CALL CONFIRM",
+         profit = activeTargetTicks,
+         stop = activeStop,
+         alert_message = "EXIT QQQ | REACTION BRACKET")
+
+if strategy.position_size < 0 and activeDir == -1
+    strategy.exit(
+         "PUT BRACKET",
+         from_entry = "PUT CONFIRM",
+         profit = activeTargetTicks,
+         stop = activeStop,
+         alert_message = "EXIT QQQ | REACTION BRACKET")
+
+// Extend visible lines while trade is active.
+if activeFilled and activeDir != 0 and showTradeLines
+    if not na(tradeEntryLine)
+        line.set_x2(tradeEntryLine, bar_index + 1)
+    if not na(tradeTargetLine)
+        line.set_x2(tradeTargetLine, bar_index + 1)
+    if not na(tradeStopLine)
+        line.set_x2(tradeStopLine, bar_index + 1)
+    if not na(tradeStructuralStopLine)
+        line.set_x2(tradeStructuralStopLine, bar_index + 1)
+
+// If confirmation filled but neither target nor stop hit by the close of the
+// confirmation bar, leave. The hypothesis is an IMMEDIATE reaction.
+if strategy.position_size != 0 and activeDir != 0 and activeFilled and barstate.isconfirmed
+    bool confirmationBarFinished = not na(activeSignalBar) and bar_index >= activeSignalBar + 1
+
+    if confirmationBarFinished
+        forcedExitReason := "NO IMMEDIATE FOLLOW-THROUGH"
+        alert(
+             "EXIT QQQ | NO IMMEDIATE FOLLOW-THROUGH" +
+             " | LEVEL_TYPE " + activeLevelName +
+             " | CONF " + activeConfidenceName,
+             alert.freq_once_per_bar_close)
+        strategy.close_all(immediately = true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLOSED TRADE -> EXIT ALERT + LABEL
+// ─────────────────────────────────────────────────────────────────────────────
+if strategy.closedtrades > lastClosedTradeCount and activeDir != 0
+    int closedIndex = strategy.closedtrades - 1
+    float realizedEntry = strategy.closedtrades.entry_price(closedIndex)
+    float realizedExit = strategy.closedtrades.exit_price(closedIndex)
+    int realizedEntryBar = strategy.closedtrades.entry_bar_index(closedIndex)
+
+    // Same-bar confirmation+exit may never appear as an open position to the script.
+    if not activeFilled
+        activeFilled := true
+        activeEntry := realizedEntry
+        activeTarget := activeDir == 1 ? f_roundTick(realizedEntry + activeTargetDistance) : f_roundTick(realizedEntry - activeTargetDistance)
+        activeEntryBar := realizedEntryBar
+
+        if activeDir == 1
+            longEntryEvent := true
+        else
+            shortEntryEvent := true
+
+        if showTradeLines
+            tradeEntryLine := line.new(realizedEntryBar, activeEntry, bar_index, activeEntry, color = color.white, width = 2)
+            tradeTargetLine := line.new(realizedEntryBar, activeTarget, bar_index, activeTarget, color = color.lime, width = 2, style = line.style_dashed)
+            tradeStopLine := line.new(realizedEntryBar, activeStop, bar_index, activeStop, color = color.red, width = 2, style = line.style_dashed)
+            tradeStructuralStopLine := line.new(realizedEntryBar, activeStructuralStop, bar_index, activeStructuralStop, color = color.new(color.red, 72), width = 1, style = line.style_dotted)
+
+            if showPriceLabels
+                label.new(realizedEntryBar, activeEntry, (activeDir == 1 ? "LONG ENTRY " : "SHORT ENTRY ") + str.tostring(activeEntry, format.mintick), style = label.style_label_left, color = activeDir == 1 ? color.lime : color.red, textcolor = activeDir == 1 ? color.black : color.white, size = size.tiny)
+
+    float directionalMove = activeDir == 1 ? realizedExit - realizedEntry : realizedEntry - realizedExit
+    float tolerance = syminfo.mintick * 1.5
+
+    bool targetExit = activeDir == 1 ? realizedExit >= activeTarget - tolerance : realizedExit <= activeTarget + tolerance
+    bool effectiveStopExit = activeDir == 1 ? realizedExit <= activeStop + tolerance : realizedExit >= activeStop - tolerance
+    bool failureWasEffective = useReactionFailureStop and math.abs(activeStop - activeFailureStop) <= tolerance
+    bool structuralWasEffective = math.abs(activeStop - activeStructuralStop) <= tolerance
+
+    string stopReason = failureWasEffective ? "REACTION FAILURE" : structuralWasEffective ? "STRUCTURAL STOP" : "STOP"
+    string exitReason = forcedExitReason != "" ? forcedExitReason : targetExit ? "REACTION TARGET" : effectiveStopExit ? stopReason : "OTHER EXIT"
+    string outcome = directionalMove > 0 ? "WIN / EXIT" : directionalMove < 0 ? "LOSS / EXIT" : "EXIT"
+
+    float closedProfit = strategy.closedtrades.profit(closedIndex)
+    if forcedExitReason != ""
+        diagExitOther += 1
+        diagPnlOther += closedProfit
+    else if targetExit
+        diagExitTarget += 1
+        diagPnlTarget += closedProfit
+    else if effectiveStopExit and failureWasEffective
+        diagExitFailure += 1
+        diagPnlFailure += closedProfit
+    else if effectiveStopExit and structuralWasEffective
+        diagExitStructural += 1
+        diagPnlStructural += closedProfit
+    else
+        diagExitOther += 1
+        diagPnlOther += closedProfit
+
+    string exitAlert = (
+         outcome + " QQQ" +
+         " | " + exitReason +
+         " | PRICE " + str.tostring(realizedExit, format.mintick) +
+         " | MOVE " + str.tostring(directionalMove, "#.##") +
+         " | LEVEL_TYPE " + activeLevelName +
+         " | CONF " + activeConfidenceName +
+         " | SCORE " + str.tostring(activeConfidence) +
+         " | FAILURE_SL " + str.tostring(activeFailureStop, format.mintick) +
+         " | STRUCT_SL " + str.tostring(activeStructuralStop, format.mintick))
+
+    bool diagWin = directionalMove > 0
+    sellExitEvent := true
+
+    diagTradesAll += 1
+    diagWinsAll += diagWin ? 1 : 0
+
+    if activeDir == 1
+        diagTradesLong += 1
+        diagWinsLong += diagWin ? 1 : 0
+    else if activeDir == -1
+        diagTradesShort += 1
+        diagWinsShort += diagWin ? 1 : 0
+
+    if activeLevelName == "LEARNED"
+        diagTradesLearned += 1
+        diagWinsLearned += diagWin ? 1 : 0
+    else if activeLevelName == "PDH"
+        diagTradesPDH += 1
+        diagWinsPDH += diagWin ? 1 : 0
+    else if activeLevelName == "PDL"
+        diagTradesPDL += 1
+        diagWinsPDL += diagWin ? 1 : 0
+    else if activeLevelName == "PMH"
+        diagTradesPMH += 1
+        diagWinsPMH += diagWin ? 1 : 0
+    else if activeLevelName == "PML"
+        diagTradesPML += 1
+        diagWinsPML += diagWin ? 1 : 0
+    else if activeLevelName == "ORH"
+        diagTradesORH += 1
+        diagWinsORH += diagWin ? 1 : 0
+    else if activeLevelName == "ORL"
+        diagTradesORL += 1
+        diagWinsORL += diagWin ? 1 : 0
+
+    if activeConfidenceName == "BASE"
+        diagTradesBase += 1
+        diagWinsBase += diagWin ? 1 : 0
+    else if activeConfidenceName == "STRONG"
+        diagTradesStrong += 1
+        diagWinsStrong += diagWin ? 1 : 0
+    else if activeConfidenceName == "A+"
+        diagTradesAPlus += 1
+        diagWinsAPlus += diagWin ? 1 : 0
+
+    if showSignalLabels
+        label.new(
+             bar_index,
+             activeDir == 1 ? high : low,
+             "ALERT: SELL / EXIT QQQ" +
+             "\n" + outcome +
+             "\n" + exitReason +
+             "\nEXIT " + str.tostring(realizedExit, format.mintick) +
+             "\nMOVE " + str.tostring(directionalMove, "#.##") +
+             "\nTYPE " + activeLevelName +
+             "\n" + activeConfidenceName + " " + str.tostring(activeConfidence),
+             style = activeDir == 1 ? label.style_label_down : label.style_label_up,
+             color = directionalMove > 0 ? color.lime : color.red,
+             textcolor = directionalMove > 0 ? color.black : color.white,
+             size = size.small)
+
+    alert(exitAlert, alert.freq_all)
+
+    if showTradeLines
+        if not na(tradeEntryLine)
+            line.set_x2(tradeEntryLine, bar_index)
+        if not na(tradeTargetLine)
+            line.set_x2(tradeTargetLine, bar_index)
+        if not na(tradeStopLine)
+            line.set_x2(tradeStopLine, bar_index)
+        if not na(tradeStructuralStopLine)
+            line.set_x2(tradeStructuralStopLine, bar_index)
+
+        line.new(
+             math.max(0, bar_index - 1),
+             realizedExit,
+             bar_index + 1,
+             realizedExit,
+             color = color.yellow,
+             width = 2,
+             style = line.style_dotted)
+
+        if showPriceLabels
+            label.new(
+                 bar_index,
+                 realizedExit,
+                 "SELL / EXIT " + str.tostring(realizedExit, format.mintick),
+                 style = label.style_label_left,
+                 color = color.yellow,
+                 textcolor = color.black,
+                 size = size.tiny)
+
+    lastClosedTradeCount := strategy.closedtrades
+
+    activeDir := 0
+    activeFilled := false
+    activeSignalClose := na
+    activeConfirmPrice := na
+    activeEntry := na
+    activeStop := na
+    activeStructuralStop := na
+    activeFailureStop := na
+    activeTarget := na
+    activeTargetDistance := na
+    activeTargetTicks := 1
+    activePlannedRiskUSD := na
+    activeLevel := na
+    activeATR := na
+    activeConfidence := 0
+    activeConfidenceName := ""
+    activeLevelName := ""
+    activeSignalBar := na
+    activeEntryBar := na
+    activeMFE := 0.0
+    forcedExitReason := ""
+
+    armedConfirmLine := na
+    tradeEntryLine := na
+    tradeTargetLine := na
+    tradeStopLine := na
+    tradeStructuralStopLine := na
+
+// Pending confirmation expires if the next bar(s) never prove the reaction.
+if activeDir != 0 and not activeFilled and strategy.position_size == 0 and barstate.isconfirmed and not na(activeSignalBar)
+    bool confirmationExpired = bar_index >= activeSignalBar + confirmationWindowBars
+    bool noTradeClosedThisCalc = strategy.closedtrades == lastClosedTradeCount
+
+    if confirmationExpired and noTradeClosedThisCalc
+        if activeDir == 1
+            strategy.cancel("CALL CONFIRM")
+            strategy.cancel("CALL BRACKET")
+        else
+            strategy.cancel("PUT CONFIRM")
+            strategy.cancel("PUT BRACKET")
+
+        diagExpiredAll += 1
+        expiredSetupEvent := true
+
+        if showSignalLabels
+            label.new(
+                 bar_index,
+                 activeDir == 1 ? low : high,
+                 "NO CONFIRM\nSETUP EXPIRED",
+                 style = activeDir == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.gray,
+                 textcolor = color.white,
+                 size = size.tiny)
+
+        if not na(armedConfirmLine)
+            line.set_x2(armedConfirmLine, bar_index)
+            line.set_color(armedConfirmLine, color.new(color.gray, 25))
+
+        activeDir := 0
+        activeFilled := false
+        activeSignalClose := na
+        activeConfirmPrice := na
+        activeEntry := na
+        activeStop := na
+        activeStructuralStop := na
+        activeFailureStop := na
+        activeTarget := na
+    activeTargetDistance := na
+    activeTargetTicks := 1
+    activePlannedRiskUSD := na
+        activeLevel := na
+        activeATR := na
+        activeConfidence := 0
+        activeConfidenceName := ""
+        activeLevelName := ""
+        activeSignalBar := na
+        activeEntryBar := na
+        activeMFE := 0.0
+        forcedExitReason := ""
+        armedConfirmLine := na
+
+// Keep counter synced after historical load.
+if strategy.closedtrades > lastClosedTradeCount and activeDir == 0
+    lastClosedTradeCount := strategy.closedtrades
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE SAME-TIME VOLUME BASELINE AFTER USING CURRENT BAR
+// ─────────────────────────────────────────────────────────────────────────────
+if barstate.isconfirmed and validSlot
+    float alpha = 2.0 / (volumeSlotLookback + 1.0)
+    float oldSlotEMA = array.get(slotVolumeEMA, slotIndex)
+    float newSlotEMA = na(oldSlotEMA) ? volume : alpha * volume + (1.0 - alpha) * oldSlotEMA
+    array.set(slotVolumeEMA, slotIndex, newSlotEMA)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS / DATA WINDOW
+// ─────────────────────────────────────────────────────────────────────────────
+plot(
+     showNearestLevels ? selectedSupport : na,
+     "Nearest Reaction Support",
+     color = color.new(color.lime, 15),
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plot(
+     showNearestLevels ? selectedResistance : na,
+     "Nearest Reaction Resistance",
+     color = color.new(color.red, 15),
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plotshape(
+     takeLongSignal,
+     title = "ARM LONG QQQ",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.orange,
+     textcolor = color.black,
+     size = size.tiny,
+     text = "ARM\nLONG")
+
+plotshape(
+     takeShortSignal,
+     title = "ARM SHORT QQQ",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.orange,
+     textcolor = color.black,
+     size = size.tiny,
+     text = "ARM\nSHORT")
+
+plotshape(
+     longEntryEvent,
+     title = "LONG QQQ Confirmed Entry",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.lime,
+     textcolor = color.black,
+     size = size.tiny,
+     text = "LONG\nENTRY")
+
+plotshape(
+     shortEntryEvent,
+     title = "SHORT QQQ Confirmed Entry",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "SHORT\nENTRY")
+
+plotshape(
+     sellExitEvent,
+     title = "SELL / EXIT QQQ",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.yellow,
+     textcolor = color.black,
+     size = size.tiny,
+     text = "SELL\nEXIT")
+
+var table diagTable = table.new(position.top_right, 6, 31, border_width = 1, frame_color = color.new(color.white, 0), border_color = color.new(color.white, 35))
+
+bgcolor(showDiagnosticsTable and tintChartForDashboard ? color.new(color.blue, 92) : na, title = "Diagnostics Dashboard Tint")
+
+if barstate.islast and showDiagnosticsTable
+    float avgTradesPerDay = rthDaysSeen > 0 ? diagTradesAll / rthDaysSeen : na
+    bool goalWinRateOK = diagTradesAll > 0 and 100.0 * diagWinsAll / diagTradesAll >= dashboardGoalWinRate
+    bool goalFreqOK = rthDaysSeen > 0 and diagTradesAll / rthDaysSeen >= dashboardGoalTradesPerDay
+
+    color titleBg = color.new(color.blue, 0)
+    color sectionBg = color.new(color.purple, 20)
+    color headerBg = color.new(color.silver, 50)
+    color normalBg = color.new(color.black, 0)
+
+    // Title row
+    table.cell(diagTable, 0, 0, "V1.10A FAILURE STOP DASH", text_color = color.white, bgcolor = titleBg, text_size = size.large)
+    table.cell(diagTable, 1, 0, "ARMED " + str.tostring(diagArmedAll), text_color = color.white, bgcolor = titleBg, text_size = size.normal)
+    table.cell(diagTable, 2, 0, "TRADES " + str.tostring(diagTradesAll), text_color = color.white, bgcolor = titleBg, text_size = size.normal)
+    table.cell(diagTable, 3, 0, "FILTERED " + str.tostring(diagFilteredAll), text_color = color.white, bgcolor = titleBg, text_size = size.normal)
+    table.cell(diagTable, 4, 0, "AVG/DAY " + (na(avgTradesPerDay) ? "n/a" : str.tostring(avgTradesPerDay, "#.00")), text_color = color.white, bgcolor = titleBg, text_size = size.normal)
+    table.cell(diagTable, 5, 0, goalWinRateOK and goalFreqOK ? "90% + 2/DAY PASS" : "NOT YET", text_color = color.white, bgcolor = goalWinRateOK and goalFreqOK ? color.new(color.green, 0) : color.new(color.red, 0), text_size = size.normal)
+
+    // Column header row
+    table.cell(diagTable, 0, 1, "SETUP", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+    table.cell(diagTable, 1, 1, "TRADES", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+    table.cell(diagTable, 2, 1, "WINS", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+    table.cell(diagTable, 3, 1, "LOSSES", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+    table.cell(diagTable, 4, 1, "WIN RATE", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+    table.cell(diagTable, 5, 1, "90%+", text_color = color.black, bgcolor = headerBg, text_size = size.normal)
+
+    // Summary rows
+    table.cell(diagTable, 0, 2, "ALL", text_color = color.white, bgcolor = sectionBg, text_size = size.normal)
+    table.cell(diagTable, 1, 2, str.tostring(diagTradesAll), text_color = color.white, bgcolor = normalBg, text_size = size.normal)
+    table.cell(diagTable, 2, 2, str.tostring(diagWinsAll), text_color = color.white, bgcolor = normalBg, text_size = size.normal)
+    table.cell(diagTable, 3, 2, str.tostring(diagTradesAll - diagWinsAll), text_color = color.white, bgcolor = normalBg, text_size = size.normal)
+    table.cell(diagTable, 4, 2, f_wrText(diagWinsAll, diagTradesAll), text_color = color.black, bgcolor = f_wrColor(diagWinsAll, diagTradesAll), text_size = size.normal)
+    table.cell(diagTable, 5, 2, f_goalText(diagWinsAll, diagTradesAll, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesAll > 0 and 100.0 * diagWinsAll / diagTradesAll >= dashboardGoalWinRate), text_size = size.normal)
+
+    table.cell(diagTable, 0, 3, "LONG", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 3, str.tostring(diagTradesLong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 3, str.tostring(diagWinsLong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 3, str.tostring(diagTradesLong - diagWinsLong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 3, f_wrText(diagWinsLong, diagTradesLong), text_color = color.black, bgcolor = f_wrColor(diagWinsLong, diagTradesLong))
+    table.cell(diagTable, 5, 3, f_goalText(diagWinsLong, diagTradesLong, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesLong > 0 and 100.0 * diagWinsLong / diagTradesLong >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 4, "SHORT", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 4, str.tostring(diagTradesShort), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 4, str.tostring(diagWinsShort), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 4, str.tostring(diagTradesShort - diagWinsShort), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 4, f_wrText(diagWinsShort, diagTradesShort), text_color = color.black, bgcolor = f_wrColor(diagWinsShort, diagTradesShort))
+    table.cell(diagTable, 5, 4, f_goalText(diagWinsShort, diagTradesShort, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesShort > 0 and 100.0 * diagWinsShort / diagTradesShort >= dashboardGoalWinRate))
+
+    // Level family section
+    table.cell(diagTable, 0, 5, "LEVEL FAMILY", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 5, "", bgcolor = sectionBg)
+    table.cell(diagTable, 2, 5, "", bgcolor = sectionBg)
+    table.cell(diagTable, 3, 5, "", bgcolor = sectionBg)
+    table.cell(diagTable, 4, 5, "", bgcolor = sectionBg)
+    table.cell(diagTable, 5, 5, "", bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 6, "LEARNED", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 6, str.tostring(diagTradesLearned), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 6, str.tostring(diagWinsLearned), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 6, str.tostring(diagTradesLearned - diagWinsLearned), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 6, f_wrText(diagWinsLearned, diagTradesLearned), text_color = color.black, bgcolor = f_wrColor(diagWinsLearned, diagTradesLearned))
+    table.cell(diagTable, 5, 6, f_goalText(diagWinsLearned, diagTradesLearned, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesLearned > 0 and 100.0 * diagWinsLearned / diagTradesLearned >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 7, "PDH", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 7, str.tostring(diagTradesPDH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 7, str.tostring(diagWinsPDH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 7, str.tostring(diagTradesPDH - diagWinsPDH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 7, f_wrText(diagWinsPDH, diagTradesPDH), text_color = color.black, bgcolor = f_wrColor(diagWinsPDH, diagTradesPDH))
+    table.cell(diagTable, 5, 7, f_goalText(diagWinsPDH, diagTradesPDH, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesPDH > 0 and 100.0 * diagWinsPDH / diagTradesPDH >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 8, "PDL", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 8, str.tostring(diagTradesPDL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 8, str.tostring(diagWinsPDL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 8, str.tostring(diagTradesPDL - diagWinsPDL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 8, f_wrText(diagWinsPDL, diagTradesPDL), text_color = color.black, bgcolor = f_wrColor(diagWinsPDL, diagTradesPDL))
+    table.cell(diagTable, 5, 8, f_goalText(diagWinsPDL, diagTradesPDL, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesPDL > 0 and 100.0 * diagWinsPDL / diagTradesPDL >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 9, "PMH", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 9, str.tostring(diagTradesPMH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 9, str.tostring(diagWinsPMH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 9, str.tostring(diagTradesPMH - diagWinsPMH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 9, f_wrText(diagWinsPMH, diagTradesPMH), text_color = color.black, bgcolor = f_wrColor(diagWinsPMH, diagTradesPMH))
+    table.cell(diagTable, 5, 9, f_goalText(diagWinsPMH, diagTradesPMH, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesPMH > 0 and 100.0 * diagWinsPMH / diagTradesPMH >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 10, "PML", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 10, str.tostring(diagTradesPML), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 10, str.tostring(diagWinsPML), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 10, str.tostring(diagTradesPML - diagWinsPML), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 10, f_wrText(diagWinsPML, diagTradesPML), text_color = color.black, bgcolor = f_wrColor(diagWinsPML, diagTradesPML))
+    table.cell(diagTable, 5, 10, f_goalText(diagWinsPML, diagTradesPML, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesPML > 0 and 100.0 * diagWinsPML / diagTradesPML >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 11, "ORH", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 11, str.tostring(diagTradesORH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 11, str.tostring(diagWinsORH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 11, str.tostring(diagTradesORH - diagWinsORH), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 11, f_wrText(diagWinsORH, diagTradesORH), text_color = color.black, bgcolor = f_wrColor(diagWinsORH, diagTradesORH))
+    table.cell(diagTable, 5, 11, f_goalText(diagWinsORH, diagTradesORH, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesORH > 0 and 100.0 * diagWinsORH / diagTradesORH >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 12, "ORL", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 12, str.tostring(diagTradesORL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 12, str.tostring(diagWinsORL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 12, str.tostring(diagTradesORL - diagWinsORL), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 12, f_wrText(diagWinsORL, diagTradesORL), text_color = color.black, bgcolor = f_wrColor(diagWinsORL, diagTradesORL))
+    table.cell(diagTable, 5, 12, f_goalText(diagWinsORL, diagTradesORL, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesORL > 0 and 100.0 * diagWinsORL / diagTradesORL >= dashboardGoalWinRate))
+
+    // Confidence section
+    table.cell(diagTable, 0, 13, "CONFIDENCE", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 13, "", bgcolor = sectionBg)
+    table.cell(diagTable, 2, 13, "", bgcolor = sectionBg)
+    table.cell(diagTable, 3, 13, "", bgcolor = sectionBg)
+    table.cell(diagTable, 4, 13, "", bgcolor = sectionBg)
+    table.cell(diagTable, 5, 13, "", bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 14, "BASE", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 14, str.tostring(diagTradesBase), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 14, str.tostring(diagWinsBase), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 14, str.tostring(diagTradesBase - diagWinsBase), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 14, f_wrText(diagWinsBase, diagTradesBase), text_color = color.black, bgcolor = f_wrColor(diagWinsBase, diagTradesBase))
+    table.cell(diagTable, 5, 14, f_goalText(diagWinsBase, diagTradesBase, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesBase > 0 and 100.0 * diagWinsBase / diagTradesBase >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 15, "STRONG", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 15, str.tostring(diagTradesStrong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 15, str.tostring(diagWinsStrong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 15, str.tostring(diagTradesStrong - diagWinsStrong), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 15, f_wrText(diagWinsStrong, diagTradesStrong), text_color = color.black, bgcolor = f_wrColor(diagWinsStrong, diagTradesStrong))
+    table.cell(diagTable, 5, 15, f_goalText(diagWinsStrong, diagTradesStrong, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesStrong > 0 and 100.0 * diagWinsStrong / diagTradesStrong >= dashboardGoalWinRate))
+
+    table.cell(diagTable, 0, 16, "A+", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 16, str.tostring(diagTradesAPlus), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 16, str.tostring(diagWinsAPlus), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 16, str.tostring(diagTradesAPlus - diagWinsAPlus), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 16, f_wrText(diagWinsAPlus, diagTradesAPlus), text_color = color.black, bgcolor = f_wrColor(diagWinsAPlus, diagTradesAPlus))
+    table.cell(diagTable, 5, 16, f_goalText(diagWinsAPlus, diagTradesAPlus, dashboardGoalWinRate), text_color = color.black, bgcolor = f_yesNoColor(diagTradesAPlus > 0 and 100.0 * diagWinsAPlus / diagTradesAPlus >= dashboardGoalWinRate))
+
+    // Frequency row
+    table.cell(diagTable, 0, 17, "CONFIRM/FREQ", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 17, diagArmedAll > 0 ? "Confirm " + str.tostring(100.0 * diagTradesAll / diagArmedAll, "#.0") + "%" : "Confirm n/a", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 17, "All " + str.tostring(diagTradesAll), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 17, "Avg/Day", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 17, f_tradesPerDayText(diagTradesAll, rthDaysSeen), text_color = color.black, bgcolor = goalFreqOK ? color.new(color.lime, 8) : color.new(color.orange, 12))
+    table.cell(diagTable, 5, 17, goalFreqOK ? "PASS" : "NO", text_color = color.black, bgcolor = f_yesNoColor(goalFreqOK))
+
+    // V1.8 surgical filter diagnostics
+    table.cell(diagTable, 0, 18, "26Y FILTERS", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 18, "BLOCKED", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 18, "CSV WR", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 18, "OLD HALF", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 18, "NEW HALF", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 5, 18, "STATUS", text_color = color.white, bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 19, "ORH|BASE 12ET", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 19, str.tostring(diagFilterORHBase12), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 19, "84.9%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 3, 19, "84.3%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 4, 19, "85.4%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 5, 19, filterORHBase12ET and use26YSurgicalFilters ? "ON" : "OFF", text_color = color.black, bgcolor = filterORHBase12ET and use26YSurgicalFilters ? color.new(color.lime, 12) : color.new(color.gray, 60))
+
+    table.cell(diagTable, 0, 20, "PML|BASE 14ET", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 20, str.tostring(diagFilterPMLBase14), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 20, "80.9%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 3, 20, "80.5%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 4, 20, "81.2%", text_color = color.black, bgcolor = color.new(color.red, 12))
+    table.cell(diagTable, 5, 20, filterPMLBase14ET and use26YSurgicalFilters ? "ON" : "OFF", text_color = color.black, bgcolor = filterPMLBase14ET and use26YSurgicalFilters ? color.new(color.lime, 12) : color.new(color.gray, 60))
+
+    table.cell(diagTable, 0, 21, "LEARNED|STR 13ET", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 21, str.tostring(diagFilterLearnedStrong13), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 21, "87.7%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 3, 21, "86.6%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 4, 21, "88.3%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 5, 21, filterLearnedStrong13ET and use26YSurgicalFilters ? "ON" : "OFF", text_color = color.black, bgcolor = filterLearnedStrong13ET and use26YSurgicalFilters ? color.new(color.lime, 12) : color.new(color.gray, 60))
+
+    table.cell(diagTable, 0, 22, "PDL|BASE 11ET", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 22, str.tostring(diagFilterPDLBase11), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 22, "86.5%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 3, 22, "85.2%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 4, 22, "87.7%", text_color = color.black, bgcolor = color.new(color.orange, 18))
+    table.cell(diagTable, 5, 22, filterPDLBase11ET and use26YSurgicalFilters ? "ON" : "OFF", text_color = color.black, bgcolor = filterPDLBase11ET and use26YSurgicalFilters ? color.new(color.lime, 12) : color.new(color.gray, 60))
+
+    table.cell(diagTable, 0, 23, "FILTER TOTAL", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 23, str.tostring(diagFilteredAll), text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 23, "V1.7 89.87%", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 23, "CSV PROJ", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 23, "~90.10%", text_color = color.black, bgcolor = color.new(color.lime, 12))
+    table.cell(diagTable, 5, 23, "TEST DEEP", text_color = color.white, bgcolor = sectionBg)
+
+    // V1.9 economic target diagnostics
+    float avgTargetCents = diagArmedAll > 0 ? diagTargetCentsSum / diagArmedAll : na
+
+    table.cell(diagTable, 0, 24, "ECON TARGET", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 24, useEconomicTarget ? "ON" : "OFF", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 24, "R " + str.tostring(economicTargetR, "#.00"), text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 24, "MIN " + str.tostring(economicTargetMinUSD, format.mintick), text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 24, "MAX " + str.tostring(economicTargetMaxUSD, format.mintick), text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 5, 24, "CONTROLLED", text_color = color.white, bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 25, "TARGET SPLIT", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 25, "1c " + str.tostring(diagTarget1Cent), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 25, "2c " + str.tostring(diagTarget2Cent), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 25, "AVG cents", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 25, na(avgTargetCents) ? "n/a" : str.tostring(avgTargetCents, "#.00"), text_color = color.black, bgcolor = color.new(color.aqua, 15))
+    table.cell(diagTable, 5, 25, "WR MUST >=90", text_color = color.white, bgcolor = normalBg)
+
+    table.cell(diagTable, 0, 26, "TEST ORDER", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 26, "26Y WR", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 26, "26Y PF", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 26, "26Y PnL", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 26, "2020+ CURVE", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 5, 26, "COMPARE V1.9", text_color = color.white, bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 27, "FAILURE STOP", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 27, useReactionFailureStop ? "ON" : "OFF", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 27, "DIST", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 27, str.tostring(reactionFailureUSD, format.mintick), text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 27, "STRUCT", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 5, 27, "BACKUP", text_color = color.white, bgcolor = sectionBg)
+
+    table.cell(diagTable, 0, 28, "EXIT COUNTS", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 28, "TP " + str.tostring(diagExitTarget), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 2, 28, "FAIL " + str.tostring(diagExitFailure), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 3, 28, "STRUCT " + str.tostring(diagExitStructural), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 4, 28, "OTHER " + str.tostring(diagExitOther), text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 5, 28, "N " + str.tostring(diagTradesAll), text_color = color.white, bgcolor = normalBg)
+
+    table.cell(diagTable, 0, 29, "EXIT PNL", text_color = color.white, bgcolor = normalBg)
+    table.cell(diagTable, 1, 29, "TP " + str.tostring(diagPnlTarget, "#.##"), text_color = color.black, bgcolor = diagPnlTarget >= 0 ? color.new(color.lime, 15) : color.new(color.red, 15))
+    table.cell(diagTable, 2, 29, "FAIL " + str.tostring(diagPnlFailure, "#.##"), text_color = color.black, bgcolor = diagPnlFailure >= 0 ? color.new(color.lime, 15) : color.new(color.red, 15))
+    table.cell(diagTable, 3, 29, "STRUCT " + str.tostring(diagPnlStructural, "#.##"), text_color = color.black, bgcolor = diagPnlStructural >= 0 ? color.new(color.lime, 15) : color.new(color.red, 15))
+    table.cell(diagTable, 4, 29, "OTHER " + str.tostring(diagPnlOther, "#.##"), text_color = color.black, bgcolor = diagPnlOther >= 0 ? color.new(color.lime, 15) : color.new(color.red, 15))
+    table.cell(diagTable, 5, 29, "REAL TV", text_color = color.white, bgcolor = normalBg)
+
+    float failureShare = diagTradesAll > 0 ? 100.0 * diagExitFailure / diagTradesAll : na
+    table.cell(diagTable, 0, 30, "FAIL SHARE", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 1, 30, na(failureShare) ? "n/a" : str.tostring(failureShare, "#.0") + "%", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 2, 30, "WATCH", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 3, 30, "PF + PNL", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 4, 30, "2020+ UP", text_color = color.white, bgcolor = sectionBg)
+    table.cell(diagTable, 5, 30, "2+/DAY", text_color = color.white, bgcolor = sectionBg)
+
+plot(showConfidenceData ? longConfidence : na, "Long Confidence", display = display.data_window)
+plot(showConfidenceData ? shortConfidence : na, "Short Confidence", display = display.data_window)
+plot(showConfidenceData ? supportTouches : na, "Support Touches", display = display.data_window)
+plot(showConfidenceData ? resistanceTouches : na, "Resistance Touches", display = display.data_window)
+plot(showConfidenceData ? supportAge : na, "Support Age Bars", display = display.data_window)
+plot(showConfidenceData ? resistanceAge : na, "Resistance Age Bars", display = display.data_window)
+plot(showConfidenceData ? supportQuality : na, "Support Formation Departure ATR", display = display.data_window)
+plot(showConfidenceData ? resistanceQuality : na, "Resistance Formation Departure ATR", display = display.data_window)
+plot(showConfidenceData ? supportConfluence : na, "Support Confluence", display = display.data_window)
+plot(showConfidenceData ? resistanceConfluence : na, "Resistance Confluence", display = display.data_window)
+plot(showConfidenceData ? slotRVOL : na, "Same-Time Relative Volume", display = display.data_window)
+plot(showConfidenceData ? approachMoveATR : na, "Approach Move ATR", display = display.data_window)
+plot(showConfidenceData ? longRejectATR : na, "Long Rejection Displacement ATR", display = display.data_window)
+plot(showConfidenceData ? shortRejectATR : na, "Short Rejection Displacement ATR", display = display.data_window)
+
+// AUTOMATION SETUP:
+// Create TradingView alert:
+// Condition -> Asads QQQ Reaction Scalper V1.10A -> Order fills and alert() function calls
+//
+// Entry messages:
+// LONG QQQ | REACTION ...
+// SHORT QQQ | REACTION ...
+//
+// Exit messages:
+// WIN / EXIT QQQ ...
+// LOSS / EXIT QQQ ...
+//
+// V1.10A keeps V1.9 entries, targets and filters. It changes only normal
+// loss treatment: a 1-cent reaction-failure stop replaces the wide structural
+// stop when it is closer. The structural stop is retained and logged as backup.
+// calc_on_order_fills stays OFF. Use Order fills + alert() function calls.

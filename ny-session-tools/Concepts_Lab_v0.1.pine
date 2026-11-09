@@ -1,0 +1,226 @@
+//@version=6
+strategy("ASADS Concepts Lab v0.1", shorttitle="ASADS LAB", overlay=true, pyramiding=0, initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=1.25, slippage=2, margin_long=5, margin_short=5, max_labels_count=50)
+// ============================================================================
+// ASADS CONCEPTS LAB — research only.
+// Trades the textbook version of popular concepts (EMAs, VWAP, ICT, round
+// numbers, opening range, RSI) one at a time with a fixed +X / -X bracket, and
+// writes the concept + context into the trade name so the exported trade list
+// can be ranked by concept, by year, and by confluence.
+// ============================================================================
+const string TZ = "America/Los_Angeles"
+float moveX = input.float(40.0, "Move to test (points)", minval=1)
+int maxBars = input.int(36, "Give up after N bars", minval=1)
+string sessEntry = input.session("0630-1250", "Entry window (Pacific)")
+
+int hhmm = hour(time, TZ) * 100 + minute(time, TZ)
+bool inWin = not na(time(timeframe.period, sessEntry, TZ))
+bool inRth = not na(time(timeframe.period, "0630-1300", TZ))
+bool inOn = not na(time(timeframe.period, "1500-0630", TZ))
+bool inOr = not na(time(timeframe.period, "0630-0700", TZ))
+bool onStart = inOn and not inOn[1]
+bool rthStart = inRth and not inRth[1]
+
+// ---------------------------------------------------------------- indicators
+float atr = ta.atr(14)
+float ema9 = ta.ema(close, 9)
+float ema21 = ta.ema(close, 21)
+float ema50 = ta.ema(close, 50)
+float ema200 = ta.ema(close, 200)
+float rsi = ta.rsi(close, 14)
+bool emaUp = ta.crossover(ema9, ema21)
+bool emaDn = ta.crossunder(ema9, ema21)
+bool rsiUp = ta.crossover(rsi, 30)
+bool rsiDn = ta.crossunder(rsi, 70)
+float ph = ta.pivothigh(high, 3, 3)
+float pl = ta.pivotlow(low, 3, 3)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ---------------------------------------------------------------- session levels + VWAP bands
+var float rthH = na
+var float rthL = na
+var float rthC = na
+var float pdh = na
+var float pdl = na
+var float onh = na
+var float onl = na
+var float orh = na
+var float orl = na
+var float sv = 0.0
+var float spv = 0.0
+var float sp2v = 0.0
+var bool orbUpDone = false
+var bool orbDnDone = false
+if onStart or (rthStart and na(onh))
+    if not na(rthH)
+        pdh := rthH
+        pdl := rthL
+    rthH := na
+    rthL := na
+if onStart
+    onh := high
+    onl := low
+else if inOn
+    onh := na(onh) ? high : math.max(onh, high)
+    onl := na(onl) ? low : math.min(onl, low)
+if rthStart
+    sv := 0.0
+    spv := 0.0
+    sp2v := 0.0
+    orh := na
+    orl := na
+    orbUpDone := false
+    orbDnDone := false
+if inRth
+    rthH := na(rthH) ? high : math.max(rthH, high)
+    rthL := na(rthL) ? low : math.min(rthL, low)
+    sv += volume
+    spv += hlc3 * volume
+    sp2v += hlc3 * hlc3 * volume
+if inOr
+    orh := na(orh) ? high : math.max(orh, high)
+    orl := na(orl) ? low : math.min(orl, low)
+bool orDone = inRth and not inOr and not na(orh)
+float vwap = inRth and sv > 0 ? spv / sv : na
+float vsd = inRth and sv > 0 ? math.sqrt(math.max(sp2v / sv - vwap * vwap, 0)) : na
+float vwapPrev = vwap[1]
+
+// ---------------------------------------------------------------- ICT fair value gaps (last unfilled one each side)
+var float bTop = na
+var float bBot = na
+var int bBar = 0
+var float sTop = na
+var float sBot = na
+var int sBar = 0
+bool fvgLong = false
+bool fvgShort = false
+if not na(bTop) and bar_index - bBar >= 2 and bar_index - bBar <= 20 and low <= bTop and close > bBot
+    fvgLong := true
+    bTop := na
+if not na(sBot) and bar_index - sBar >= 2 and bar_index - sBar <= 20 and high >= sBot and close < sTop
+    fvgShort := true
+    sBot := na
+if bar_index - bBar > 20
+    bTop := na
+if bar_index - sBar > 20
+    sBot := na
+if low > high[2] and low - high[2] >= 0.15 * atr
+    bTop := low
+    bBot := high[2]
+    bBar := bar_index
+if high < low[2] and low[2] - high >= 0.15 * atr
+    sTop := low[2]
+    sBot := high
+    sBar := bar_index
+
+// ---------------------------------------------------------------- concept events (textbook versions)
+float tol = 0.1 * atr
+float r100 = math.round(close / 100) * 100
+bool sweepL = (not na(pdl) and low < pdl and close > pdl) or (not na(onl) and inRth and low < onl and close > onl)
+bool sweepH = (not na(pdh) and high > pdh and close < pdh) or (not na(onh) and inRth and high > onh and close < onh)
+bool stackUp = ema9 > ema21 and ema21 > ema50
+bool stackDn = ema9 < ema21 and ema21 < ema50
+
+array<string> names = array.new<string>()
+array<int> dirs = array.new<int>()
+if sweepL
+    names.push("ICT_SWEEP_LOW")
+    dirs.push(1)
+if sweepH
+    names.push("ICT_SWEEP_HIGH")
+    dirs.push(-1)
+if fvgLong
+    names.push("ICT_FVG")
+    dirs.push(1)
+if fvgShort
+    names.push("ICT_FVG")
+    dirs.push(-1)
+if not na(lastPH) and close > lastPH and close[1] <= lastPH
+    names.push("ICT_BOS")
+    dirs.push(1)
+if not na(lastPL) and close < lastPL and close[1] >= lastPL
+    names.push("ICT_BOS")
+    dirs.push(-1)
+if low < r100 and close > r100 + tol
+    names.push("ROUND_100")
+    dirs.push(1)
+if high > r100 and close < r100 - tol
+    names.push("ROUND_100")
+    dirs.push(-1)
+if orDone and not orbUpDone and close > orh
+    names.push("ORB")
+    dirs.push(1)
+if orDone and not orbDnDone and close < orl
+    names.push("ORB")
+    dirs.push(-1)
+if not na(vwap) and not na(vwapPrev) and hhmm >= 645 and close > vwap and close[1] <= vwapPrev
+    names.push("VWAP_RECLAIM")
+    dirs.push(1)
+if not na(vwap) and not na(vwapPrev) and hhmm >= 645 and close < vwap and close[1] >= vwapPrev
+    names.push("VWAP_RECLAIM")
+    dirs.push(-1)
+if not na(vsd) and vsd > 0 and low < vwap - 2 * vsd and close > vwap - 2 * vsd
+    names.push("VWAP_2SD_FADE")
+    dirs.push(1)
+if not na(vsd) and vsd > 0 and high > vwap + 2 * vsd and close < vwap + 2 * vsd
+    names.push("VWAP_2SD_FADE")
+    dirs.push(-1)
+if ema200 > ema200[10] and low <= ema200 + tol and close > ema200
+    names.push("EMA200_TAP")
+    dirs.push(1)
+if ema200 < ema200[10] and high >= ema200 - tol and close < ema200
+    names.push("EMA200_TAP")
+    dirs.push(-1)
+if stackUp and low <= ema21 and close > ema21
+    names.push("EMA21_PULLBACK")
+    dirs.push(1)
+if stackDn and high >= ema21 and close < ema21
+    names.push("EMA21_PULLBACK")
+    dirs.push(-1)
+if emaUp
+    names.push("EMA9_21_CROSS")
+    dirs.push(1)
+if emaDn
+    names.push("EMA9_21_CROSS")
+    dirs.push(-1)
+if rsiUp
+    names.push("RSI_REVERSAL")
+    dirs.push(1)
+if rsiDn
+    names.push("RSI_REVERSAL")
+    dirs.push(-1)
+
+if orDone and close > orh
+    orbUpDone := true
+if orDone and close < orl
+    orbDnDone := true
+
+int nLong = 0
+int nShort = 0
+for d0 in dirs
+    if d0 == 1
+        nLong += 1
+    else
+        nShort += 1
+
+// ---------------------------------------------------------------- run one test trade at a time
+f_r(float x) => na(x) ? "na" : str.tostring(x, "#.##")
+var int rBar = 0
+if strategy.position_size != 0 and (bar_index - rBar >= maxBars or (hhmm >= 1310 and hhmm < 1500))
+    strategy.close_all(comment="TIME")
+if strategy.position_size == 0 and inWin and atr > 0 and dirs.size() > 0
+    string nm = names.get(0)
+    int d = dirs.get(0)
+    float prem = not na(rthH) and rthH > rthL ? (close - rthL) / (rthH - rthL) : na
+    string ctx = nm + "|" + (d == 1 ? "L" : "S") + "|h" + str.tostring(hhmm) + "|sk" + str.tostring(stackUp ? 1 : stackDn ? -1 : 0) + "|vs" + str.tostring(na(vwap) ? 0 : close > vwap ? 1 : -1) + "|e2" + str.tostring(close > ema200 ? 1 : -1) + "|cL" + str.tostring(nLong) + "|cS" + str.tostring(nShort) + "|pd" + f_r(prem) + "|at" + f_r(atr) + "|all:" + array.join(names, ",")
+    string id = d == 1 ? "L" : "S"
+    strategy.entry(id, d == 1 ? strategy.long : strategy.short, qty=1, comment=ctx)
+    strategy.exit("X", id, stop=close - d * moveX, limit=close + d * moveX, comment_profit="WIN", comment_loss="LOSS")
+    rBar := bar_index
+
+plot(vwap, "VWAP", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(ema200, "EMA 200", color.new(color.purple, 30), 1)
