@@ -1,4 +1,4 @@
-# Pine Script Portfolio — Asad Kurbonov
+# Pine Script Portfolio — Asadbek Bakhodirov
 
 TradingView indicators and strategies I've built for MNQ (Micro Nasdaq futures) and QQQ, written in **Pine Script v6**. About **22,000 lines** across 12 scripts.
 
@@ -58,4 +58,4 @@ The largest project. One script maps the market and another makes decisions from
 
 **Contact:** open an issue here, or message me on Fiverr/Upwork.
 
-*© Asad Kurbonov. Shared for viewing and portfolio purposes. Please ask before reusing or reselling.*
+*© Asadbek Bakhodirov. Shared for viewing and portfolio purposes. Please ask before reusing or reselling.*
